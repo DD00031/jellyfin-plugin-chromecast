@@ -1,0 +1,78 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Jellyfin.Plugin.Chromecast</RootNamespace>
+    <AssemblyName>Jellyfin.Plugin.Chromecast</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!--
+      Jellyfin's plugin loader recursively loads every .dll under the plugin folder, including
+      RID-specific "runtimes/**" assets - it has no RID-aware resolution like a normal apphost.
+      A transitive dependency can ship a browser/WASM-targeted assembly under runtimes/browser/lib,
+      which conflicts with the copy already loaded by the host and disables the whole plugin.
+      Disabling copy of these RID-specific assets keeps only the generic managed assembly, which
+      is all a framework-dependent, in-process plugin needs. (Confirmed necessary by the previous
+      jellycast prototype - see CLAUDE.md.)
+    -->
+    <CopyLocalRuntimeTargetAssets>false</CopyLocalRuntimeTargetAssets>
+  </PropertyGroup>
+
+  <!--
+    Jellyfin's Controller/Model assemblies get a new AssemblyVersion on every patch release, and a
+    plugin built against one patch fails to load with a bare "Could not load file or assembly"
+    error against any other patch - there is no forward/backward tolerance at runtime. Rebuild
+    against a specific server version with:
+      dotnet build -p:JellyfinServerVersion=12.0.1 Jellyfin.Plugin.Chromecast.csproj
+  -->
+  <PropertyGroup>
+    <JellyfinServerVersion Condition="'$(JellyfinServerVersion)' == ''">12.0.0</JellyfinServerVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinServerVersion)">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+    <PackageReference Include="Jellyfin.Model" Version="$(JellyfinServerVersion)">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      CastV2 protocol, mDNS discovery and media control for Google Cast devices. Vendored with a
+      small patch rather than referenced as a plain NuGet package - see
+      external/Sharpcaster/PATCH.md for why.
+    -->
+    <ProjectReference Include="..\external\Sharpcaster\Sharpcaster.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="Configuration\configPage.html" />
+    <EmbeddedResource Include="Configuration\configPage.html" />
+  </ItemGroup>
+
+  <!--
+    Jellyfin's plugin loader gives each plugin its own isolated AssemblyLoadContext and, before
+    activating it, eagerly resolves every member signature via reflection - including
+    ISessionController/IPluginServiceRegistrator parameters typed as IServiceCollection and
+    ILogger<T>. If a transitive dependency ships its own copies of Microsoft.Extensions.* assemblies
+    alongside the plugin, the isolated load context can resolve those instead of the host's - a
+    different assembly identity for the "same" type - which fails reflection with a TypeLoadException
+    and disables the whole plugin. Jellyfin's host always provides these packages itself, so strip
+    any copies after publish and let the plugin load context fall through to the host's.
+  -->
+  <Target Name="RemoveHostProvidedAssemblies" AfterTargets="Publish">
+    <ItemGroup>
+      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.DependencyInjection.dll" />
+      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.DependencyInjection.Abstractions.dll" />
+      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.Logging.Abstractions.dll" />
+      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.Logging.dll" />
+      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.Options.dll" />
+    </ItemGroup>
+    <Delete Files="@(_HostProvidedAssembly)" Condition="Exists('%(_HostProvidedAssembly.Identity)')" />
+  </Target>
+
+</Project>

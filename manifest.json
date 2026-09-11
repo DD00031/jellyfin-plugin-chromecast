@@ -1,0 +1,12 @@
+[
+  {
+    "guid": "06afff54-6a74-4e08-9d50-9fa63803c73d",
+    "name": "Chromecast",
+    "description": "Discovers Google Cast (Chromecast) devices on the local network and exposes each one as a session in Jellyfin's existing cast/remote-control interface. Casting is handed off to Jellyfin's own cast receiver app, so it works the same way it already does for Chrome/Android users - but from every client, including iOS/iPadOS/macOS.",
+    "overview": "Cast to Google Cast devices from Jellyfin's built-in cast interface, on every client including iOS/iPadOS/macOS.",
+    "owner": "DD00031",
+    "category": "General",
+    "imageUrl": "https://raw.githubusercontent.com/DD00031/jellyfin-plugin-chromecast/main/.github/assets/icon.png",
+    "versions": []
+  }
+]

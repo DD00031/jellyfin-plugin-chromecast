@@ -1,0 +1,10 @@
+bin/
+obj/
+publish/
+*.zip
+.vs/
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.user
+.DS_Store

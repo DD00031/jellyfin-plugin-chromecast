@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Chromecast</title>
+</head>
+<body>
+    <div id="ChromecastConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+        <div data-role="content">
+            <div class="content-primary">
+                <form id="ChromecastConfigForm">
+                    <div class="verticalSection">
+                        <h2>Chromecast</h2>
+                        <p>Discovers Google Cast devices on the local network and adds them to Jellyfin's built-in cast interface on every client, including iOS/iPadOS/macOS.</p>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="DiscoveryIntervalSeconds">Discovery interval (seconds)</label>
+                        <input id="DiscoveryIntervalSeconds" name="DiscoveryIntervalSeconds" type="number" is="emby-input" min="5" required />
+                        <div class="fieldDescription">How often to scan the local network for Chromecast devices.</div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="DeviceStaleAfterSeconds">Device timeout (seconds)</label>
+                        <input id="DeviceStaleAfterSeconds" name="DeviceStaleAfterSeconds" type="number" is="emby-input" min="30" required />
+                        <div class="fieldDescription">How long a device may go unseen before it is removed from the cast menu.</div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="DeviceNamePrefix">Device name prefix</label>
+                        <input id="DeviceNamePrefix" name="DeviceNamePrefix" type="text" is="emby-input" />
+                        <div class="fieldDescription">Optional text prepended to each device's name in the cast menu, e.g. "Cast - ".</div>
+                    </div>
+
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input id="UseUnstableReceiver" name="UseUnstableReceiver" type="checkbox" is="emby-checkbox" />
+                            <span>Use the unstable receiver build</span>
+                        </label>
+                        <div class="fieldDescription">Matches the "Google Cast version" option available to web/Chrome users. Leave off unless testing receiver-side fixes.</div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="AccessTokenLifetimeMinutes">Access token safety-net lifetime (minutes)</label>
+                        <input id="AccessTokenLifetimeMinutes" name="AccessTokenLifetimeMinutes" type="number" is="emby-input" min="10" required />
+                        <div class="fieldDescription">The token minted for the receiver on cast start is revoked when playback stops; this is a fallback expiry in case that is missed (e.g. a server restart mid-cast).</div>
+                    </div>
+
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input id="EnableDebugLogging" name="EnableDebugLogging" type="checkbox" is="emby-checkbox" />
+                            <span>Enable verbose logging</span>
+                        </label>
+                        <div class="fieldDescription">Logs CastV2 protocol and discovery detail to the server log. Only enable while troubleshooting.</div>
+                    </div>
+
+                    <div>
+                        <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                            <span>Save</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    <script type="text/javascript">
+        (function () {
+            const pluginId = '06afff54-6a74-4e08-9d50-9fa63803c73d';
+
+            function loadConfig(page) {
+                Dashboard.showLoadingMsg();
+                ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                    page.querySelector('#DiscoveryIntervalSeconds').value = config.DiscoveryIntervalSeconds;
+                    page.querySelector('#DeviceStaleAfterSeconds').value = config.DeviceStaleAfterSeconds;
+                    page.querySelector('#DeviceNamePrefix').value = config.DeviceNamePrefix;
+                    page.querySelector('#UseUnstableReceiver').checked = config.UseUnstableReceiver;
+                    page.querySelector('#AccessTokenLifetimeMinutes').value = config.AccessTokenLifetimeMinutes;
+                    page.querySelector('#EnableDebugLogging').checked = config.EnableDebugLogging;
+                    Dashboard.hideLoadingMsg();
+                });
+            }
+
+            function saveConfig(page) {
+                Dashboard.showLoadingMsg();
+                ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                    config.DiscoveryIntervalSeconds = Number(page.querySelector('#DiscoveryIntervalSeconds').value);
+                    config.DeviceStaleAfterSeconds = Number(page.querySelector('#DeviceStaleAfterSeconds').value);
+                    config.DeviceNamePrefix = page.querySelector('#DeviceNamePrefix').value;
+                    config.UseUnstableReceiver = page.querySelector('#UseUnstableReceiver').checked;
+                    config.AccessTokenLifetimeMinutes = Number(page.querySelector('#AccessTokenLifetimeMinutes').value);
+                    config.EnableDebugLogging = page.querySelector('#EnableDebugLogging').checked;
+
+                    ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
+                        Dashboard.processPluginConfigurationUpdateResult(result);
+                    });
+                });
+            }
+
+            document.querySelector('#ChromecastConfigPage')
+                .addEventListener('pageshow', function () {
+                    loadConfig(this);
+                });
+
+            document.querySelector('#ChromecastConfigForm')
+                .addEventListener('submit', function (e) {
+                    e.preventDefault();
+                    saveConfig(this.closest('.page'));
+                    return false;
+                });
+        })();
+    </script>
+</body>
+</html>
