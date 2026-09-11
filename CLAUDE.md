@@ -430,14 +430,49 @@ queries/joins) had no live state to show at all, which looked indistinguishable 
 playing here" to a client trying to join. No code changes were needed beyond the parsing fix
 already committed.
 
+### RESOLVED: adding to the queue crashed the whole stream
+
+`SendPlayCommandCoreAsync` always launched a fresh receiver app instance and sent "PlayNow"
+regardless of what `PlayRequest.PlayCommand` actually asked for - so `PlayNext`/`PlayLast` (how
+Jellyfin represents "add to queue") relaunched and restarted the whole session exactly like a
+brand new cast, destroying whatever was already playing. Fixed: `PlayNext`/`PlayLast` now go
+through a new `SendQueueCommandAsync` that reuses the existing connection/app instance (no
+relaunch) and sends the matching `"PlayNext"`/`"PlayLast"` receiver command, only when something
+is already actively casting (otherwise logs a warning and no-ops). Confirmed by testing: adding an
+item to the queue while something else plays no longer interrupts playback.
+
+### RESOLVED: the receiver's "ready to cast" screen stopped appearing
+
+The receiver only shows its own branded waiting/idle screen
+(`DocumentManager.setAppStatus(Waiting)` in its source) in response to an explicit `"Identify"`
+command - this plugin never sent one, so a fresh launch went straight from blank to loading media
+with no visible "connected" moment. This wasn't a real regression from earlier working behavior;
+what the user recalled seeing was residual receiver state left over from a *previous* test's
+natural idle transition during the heavy back-to-back testing earlier in this session - once the
+device was rebooted to a clean state, the gap became visible. Fixed: `"Identify"` is now sent
+right after launch, before `"PlayNow"`. Confirmed by testing: the ready screen now flashes briefly
+before playback starts.
+
+### Investigated, not fixable from this plugin: "(Google Cast Unsupported)" text in the cast menu
+
+Confirmed via jellyfin-web's own source (`src/components/playback/playerSelectionMenu.js`): this
+text is shown whenever `pluginManager.plugins` (a purely client-side JS registry) has no entry
+with `id === 'chromecast'` - which is the *built-in*, Chrome-only `chromecastPlayer` JS plugin
+(`src/plugins/chromecastPlayer/plugin.js`, `this.id = 'chromecast'`), which only ever registers
+itself when `window.chrome.cast` (Google's own Cast Sender SDK) is present. This check is
+completely independent of whether any actual cast targets are available - it will show this text
+in Safari/WKWebView (and therefore the iOS/macOS apps) regardless of what this plugin does,
+because there is no bridge for a server-side C# plugin to register anything in that client-side
+registry. A real fix would mean patching jellyfin-web itself (e.g. changing that condition to also
+check for available cast-type targets) and rebuilding/distributing a patched jellyfin-web - a
+legitimately separate project, out of scope here. Purely cosmetic otherwise: casting itself is
+unaffected.
+
 ### Still open
 
-- Explicitly re-test the skip forward/back buttons via real button presses (not just direct
-  `SeekPositionTicks` API calls) and volume/mute (user reports these already work well, but not
-  re-verified after this round of fixes - should be unaffected either way).
-- Test multi-item queue playback (`NextTrack`/`PreviousTrack`) - the receiver keeps its own queue
-  from the full `items` list passed in `PlayNow`, but this hasn't been exercised with more than
-  one item.
+- Test multi-item queue playback more thoroughly (`NextTrack`/`PreviousTrack` navigation through a
+  queue built via repeated `PlayLast` calls - the *adding* half is now confirmed working, the
+  *playing through it* half isn't yet explicitly re-tested since the queue-add fix).
 - Decide whether the `HeartbeatChannel.AdditionalDestinationId` patch and the plugin's own 5s
   keep-alive timer are still worth keeping now that the real fix (patch 4, the receive-loop
   try/catch) is in - they were reasonable hardening added while still hypothesizing about the

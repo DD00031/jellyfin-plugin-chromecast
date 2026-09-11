@@ -591,8 +591,18 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
                     await HandlePlaybackProgressAsync(status.Data).ConfigureAwait(false);
                     break;
                 case "playbackstop":
+                    // Deliberately does NOT revoke the access token here. A "playbackstop"
+                    // broadcast fires for the *current item* stopping, which also happens for a
+                    // perfectly normal mid-queue transition (item N finishing right before item
+                    // N+1 starts, e.g. after NextTrack) - not only when the whole cast session
+                    // ends. Revoking here broke exactly that case (confirmed by testing): the
+                    // token died between items, the receiver's own follow-up API calls for the
+                    // next item failed with "Invalid token", and it gave up with an unhelpful
+                    // empty "connectionerror" broadcast, stopping playback entirely instead of
+                    // advancing. Token revocation now only happens on an explicit user Stop
+                    // command, a CastV2 disconnect, or this controller being disposed - see
+                    // RevokeAccessTokenAsync's other call sites.
                     await HandlePlaybackStopAsync(status.Data).ConfigureAwait(false);
-                    await RevokeAccessTokenAsync().ConfigureAwait(false);
                     break;
                 case "error":
                 case "connectionerror":
