@@ -272,22 +272,59 @@ H.264 item and an HEVC item were cast, watched playing on the actual TV, and con
    assembly" lines. Fixed with `<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>`
    in the plugin `.csproj`.
 
-### Known follow-up issue: the CastV2 control connection doesn't reliably survive between commands
+### RESOLVED: the CastV2 control connection didn't reliably survive between commands
 
-After a successful cast, a `Pause` sent even a short while later (tens of seconds) can fail with
-the same "dead `SslStream`" write error described above. **Playback itself is unaffected** -
-confirmed by asking the user to check the TV, which kept playing normally - because the receiver
-runs its own HLS playback independently via its own HTTP requests to Jellyfin, completely separate
-from this plugin's CastV2 control channel. Only the *ability to send further commands* (pause,
-seek, stop, volume) is affected until a fresh `SendPlayCommand` reconnects. Root cause not yet
-found - candidates: `Sharpcaster.Channels.HeartbeatChannel` not actually keeping the connection
-alive (there's an existing nullability warning on its timer callback worth looking at first), or
-the Chromecast itself closing idle CastV2 connections faster than expected. `SendPlaystateCommand`
-also does not currently attempt to reconnect on its own the way `SendPlayCommand` does (it just
-no-ops via its `_connectSdkChannel is null` guard) - worth deciding whether pause/seek/stop should
-trigger a reconnect-and-rejoin, though there's nothing meaningful to reconnect *to* without
-re-deriving the running app's transport id, which would need a `ChromecastStatus` query after
-reconnecting rather than a fresh launch.
+Confirmed fixed by testing: cast → wait 38s (well past the previous ~20-30s failure window) →
+`Pause` → **actually paused on the TV** → `Unpause` → `Stop` → **actually stopped on the TV**,
+with the minted access token correctly revoked (`Logging out access token` in the server log) on
+`Stop`. Also confirmed: the "Play On" session's live `PlayState` (position, pause state, ...) now
+populates correctly during playback, which it never reliably did before either - same root cause.
+
+The actual root cause turned out to be completely different from what the symptom ("dead SslStream
+write error" a while after casting) suggested, and had nothing to do with heartbeat timing as
+such. Real Chromecast hardware sends unsolicited `MEDIA_STATUS` broadcasts (CAF's own internal
+media session status - the receiver uses `cast.framework.PlayerManager` internally, so this
+happens regardless of anything this plugin's own connectsdk protocol does). One such broadcast had
+a `"requestId"` value that didn't fit `System.Text.Json`'s deserialization target
+(`MessageWithId.RequestId` is a plain `System.Int32`), throwing a `JsonException` **outside** the
+one per-message try/catch that existed in SharpCaster's receive loop. That exception propagated
+all the way out to the try/catch wrapping the *entire* `while(true)` receive loop, whose `catch`
+just logs and lets the loop end - silently, permanently. Every subsequent inbound message was lost
+from that point on, including this same client's own heartbeat PONG replies. The "heartbeat
+timeout" disconnect actually observed ~20-30s later wasn't a real heartbeat failure - it was this
+client finally noticing, on its own 10s+10s timer, a symptom of the receive loop having already
+died seconds after the cast started.
+
+This was hard to see for a long time because `new ChromecastClient()` (the parameterless
+constructor, which is what this plugin was using) passes a **null logger** through to every
+built-in SharpCaster channel, silencing all of its own diagnostics - heartbeat ping/pong, and
+critically, the receive-loop error itself. Debugging only became tractable after (a) passing a
+real `ILogger<ChromecastClient>` in `EnsureConnectedAsync`, and (b) temporarily raising the
+`Sharpcaster`/`Jellyfin.Plugin.Chromecast` log categories to `Debug` in
+`config/logging.default.json` (reverted afterward - don't leave verbose logging on by default).
+
+Fixes (see `external/Sharpcaster/PATCH.md` patch 4 for the main one, patch 3 for a secondary real
+bug found along the way that didn't turn out to be the cause):
+- **The actual fix**: wrap each message's processing in the receive loop in its own try/catch
+  instead of one try/catch around the whole loop, so a single malformed/unexpected message can
+  never take the entire connection down.
+- `HeartbeatChannel.TimerElapsed` now restarts its own timer after sending an outbound ping
+  (`AutoReset = false` meant the "did we get a response" check could otherwise never run - a real,
+  separate, confirmed bug, just not the one causing this particular symptom).
+- `HeartbeatChannel` gained a settable `AdditionalDestinationId` so heartbeat traffic can also
+  target a launched app's own transport id, not just `"receiver-0"` - speculative hardening, not
+  confirmed necessary once the real fix was in, but cheap and plausible for other devices/firmware.
+- The plugin now passes a real logger into `new ChromecastClient(...)`, and keeps a periodic
+  lightweight keep-alive (`ConnectionChannel.ConnectAsync` + `ReceiverChannel.GetChromecastStatusAsync`
+  every 5s) to the app's transport while a cast is active, on top of the heartbeat fixes - belt and
+  suspenders, not the load-bearing fix, but reasonable to keep.
+- `ConnectSdkStatusMessage.Data` was modeled as a JSON-encoded *string*; a live wire capture showed
+  it's actually a nested JSON *object* shaped like the receiver's `getSenderReportingData()` output
+  (`{ ItemId, PlayState: {...}, QueueableMediaTypes, NowPlayingItem }`), where `PlayState` - not
+  `Data` itself - is what maps onto `PlaybackProgressInfo`. Every status broadcast was silently
+  failing to parse ("malformed connectsdk message") until this was fixed, independent of the
+  receive-loop issue - this is why session `PlayState` visibility didn't work even in the brief
+  windows where the connection happened to still be alive.
 
 ### macOS-specific testing gotchas (irrelevant to real deployment, but costly if hit again)
 
@@ -334,18 +371,27 @@ repo and must never be committed - treat any such key as a local secret only.
 
 ### Remaining before this is a real release
 
-- Root-cause and fix the control-connection-longevity issue above.
-- Decide whether `SendPlaystateCommand` should attempt to reconnect on failure.
-- Confirm the exact JSON field casing of `PlaybackProgressInfo` inside connectsdk status
-  broadcasts against a live wire capture (assumed PascalCase and this has worked in every test so
-  far, but never explicitly logged/verified byte-for-byte).
-- Test seek, stop (including confirming the minted access token is actually revoked - the code
-  path exists and calls `ISessionManager.Logout`, but hasn't been explicitly confirmed by checking
-  for the token disappearing), volume/mute, and multi-item queue playback (`NextTrack`).
-- Test from an actual iOS/iPadOS/macOS Jellyfin client's cast UI, not just direct REST API calls -
-  confirm the device actually appears in and is controllable from the real "Play On" interface.
+Confirmed working (see above): discovery, cast, H.265 transcode, play/pause/unpause/stop, live
+`PlayState` visibility, access token revocation on stop, and - per the user - casting from the
+actual iOS and macOS Jellyfin apps' own cast UI (not just direct REST API calls), to the same
+extent as everything tested here directly.
+
+Still open:
+- Test seek and volume/mute specifically (not yet exercised - only Play/Pause/Unpause/Stop have
+  been).
+- Test multi-item queue playback (`NextTrack`/`PreviousTrack`) - the receiver keeps its own queue
+  from the full `items` list passed in `PlayNow`, but this hasn't been exercised with more than
+  one item.
+- Decide whether the `HeartbeatChannel.AdditionalDestinationId` patch and the plugin's own 5s
+  keep-alive timer are still worth keeping now that the real fix (patch 4, the receive-loop
+  try/catch) is in - they were reasonable hardening added while still hypothesizing about the
+  cause, not proven necessary on their own. Low priority to revisit; they're harmless as-is.
 - Clean up the `NU1510` NuGet warnings in the vendored `Sharpcaster.csproj` (harmless, low
   priority).
+- Consider proposing the four Sharpcaster patches upstream (see `external/Sharpcaster/PATCH.md`)
+  to eventually drop the vendoring.
+- Write real user-facing installation instructions (README currently just points here) once ready
+  to cut an actual release/manifest entry.
 
 ## Building
 
