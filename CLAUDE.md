@@ -468,17 +468,29 @@ check for available cast-type targets) and rebuilding/distributing a patched jel
 legitimately separate project, out of scope here. Purely cosmetic otherwise: casting itself is
 unaffected.
 
+### RESOLVED: NextTrack broke playback entirely instead of advancing to the queued item
+
+Found immediately while re-testing queue navigation after the queue-add fix above: cast an item,
+add a second via `PlayLast`, send `NextTrack` - it correctly advanced server-side (session state
+showed the new item) but playback actually **stopped** on the device, with the receiver
+broadcasting an empty `"connectionerror"`.
+
+Root cause: `OnConnectSdkStatusReceived`'s `"playbackstop"` case unconditionally called
+`RevokeAccessTokenAsync()`. A `"playbackstop"` broadcast fires for the *current item* stopping -
+which also happens for a perfectly normal mid-queue transition (item N finishing right before item
+N+1 starts), not only when the whole cast session ends. Revoking the token there killed it between
+queue items; the receiver's own follow-up API call for the next item then failed with "Invalid
+token" (confirmed in the server log), and the receiver gave up instead of advancing. Fixed by
+removing that revocation call - token revocation now only happens on an explicit user Stop
+command, a CastV2 disconnect, or this controller being disposed. Confirmed fixed: `NextTrack` now
+correctly advances to and plays the queued item.
+
 ### Still open
 
-- Test multi-item queue playback more thoroughly (`NextTrack`/`PreviousTrack` navigation through a
-  queue built via repeated `PlayLast` calls - the *adding* half is now confirmed working, the
-  *playing through it* half isn't yet explicitly re-tested since the queue-add fix).
 - Decide whether the `HeartbeatChannel.AdditionalDestinationId` patch and the plugin's own 5s
   keep-alive timer are still worth keeping now that the real fix (patch 4, the receive-loop
   try/catch) is in - they were reasonable hardening added while still hypothesizing about the
   cause, not proven necessary on their own. Low priority to revisit; they're harmless as-is.
-- Clean up the `NU1510` NuGet warnings in the vendored `Sharpcaster.csproj` (harmless, low
-  priority).
 - Consider proposing the four Sharpcaster patches upstream (see `external/Sharpcaster/PATCH.md`)
   to eventually drop the vendoring.
 - Write real user-facing installation instructions (README currently just points here) once ready
