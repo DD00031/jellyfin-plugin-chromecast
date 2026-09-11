@@ -1,6 +1,6 @@
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.Json.Serialization;
-using MediaBrowser.Model.Dto;
 
 namespace Jellyfin.Plugin.Chromecast.Cast;
 
@@ -40,9 +40,15 @@ public sealed class PlayNowOptions
 {
     /// <summary>
     /// Gets or sets the items to play, as full DTOs - the receiver reads item metadata directly
-    /// from these rather than fetching them itself.
+    /// from these rather than fetching them itself. Pre-serialized to <see cref="JsonElement"/>
+    /// (with Jellyfin's normal PascalCase API casing, not this envelope's camelCase) by the
+    /// caller, since each <c>BaseItemDto</c> must keep the exact field names/casing a real
+    /// <c>GET /Items</c> response would use - the receiver's TS code reads these as genuine
+    /// Jellyfin API DTOs, not as this envelope's own camelCase wrapper fields. Serializing a
+    /// nested BaseItemDto through the same camelCase options as the rest of this envelope would
+    /// silently rename every one of its properties and the receiver would fail to read them.
     /// </summary>
-    public required IReadOnlyList<BaseItemDto> Items { get; set; }
+    public required IReadOnlyList<JsonElement> Items { get; set; }
 
     /// <summary>
     /// Gets or sets the position (in ticks) to start playback from.

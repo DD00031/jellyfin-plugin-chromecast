@@ -58,6 +58,13 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     private ChromecastClient? _client;
     private ConnectSdkChannel? _connectSdkChannel;
 
+    /// <summary>
+    /// The running receiver app's CastV2 transport id. Messages for the app (as opposed to the
+    /// receiver platform itself) must be addressed to this, not the default "receiver-0"
+    /// destination - see <see cref="ConnectSdkChannel.SendCommandAsync"/>.
+    /// </summary>
+    private string? _appTransportId;
+
     private string? _mintedAccessToken;
 
     private bool _disposed;
@@ -150,6 +157,41 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             return;
         }
 
+        try
+        {
+            await SendPlayCommandCoreAsync(command, items, user, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Jellyfin's SessionManager does not appear to await/observe the task this method
+            // returns (commands are broadcast to every session controller without necessarily
+            // waiting on each one) - an exception left to propagate out of here would vanish
+            // silently instead of ever reaching a log, which is exactly what made an earlier bug
+            // in this method look like a silent hang instead of the fault it actually was.
+            _logger.LogError(ex, "Error casting to Chromecast {Name}", _receiver.Name);
+
+            // A failure here (e.g. a write to a dead SslStream because the device closed the
+            // connection between casts without us noticing) means the cached client can no
+            // longer be trusted - without this, every subsequent cast attempt would keep
+            // failing the same way against the same broken connection. The next attempt will
+            // reconnect from scratch via EnsureConnectedAsync.
+            InvalidateConnection();
+        }
+    }
+
+    /// <summary>
+    /// Drops the cached CastV2 connection so the next cast attempt reconnects from scratch,
+    /// without trying to gracefully close a connection that may already be dead.
+    /// </summary>
+    private void InvalidateConnection()
+    {
+        _client = null;
+        _connectSdkChannel = null;
+        _appTransportId = null;
+    }
+
+    private async Task SendPlayCommandCoreAsync(PlayRequest command, List<BaseItemDto> items, User? user, CancellationToken cancellationToken)
+    {
         var client = await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
         if (client is null || _connectSdkChannel is null)
         {
@@ -170,18 +212,44 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
         _logger.LogInformation("Casting {Count} item(s) starting with {ItemName} to {DeviceName}", items.Count, items[0].Name, _receiver.Name);
 
-        await client.LaunchApplicationAsync(appId).ConfigureAwait(false);
+        // SharpCaster's request/response matching (WaitingTasks) has no built-in timeout - if a
+        // response never arrives (a dropped packet, a device that doesn't answer a particular
+        // status request the way expected, ...) the awaited call hangs forever with no exception
+        // and no log output. Wrap with our own timeout so a flaky device degrades to a clear,
+        // recoverable failure instead of silently wedging this session's casting ability.
+        var launchTask = client.LaunchApplicationAsync(appId, joinExistingApplicationSession: false);
+        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+        var completed = await Task.WhenAny(launchTask, timeoutTask).ConfigureAwait(false);
+        if (completed == timeoutTask)
+        {
+            _logger.LogWarning("Timed out launching the Jellyfin receiver on {Name} - aborting cast", _receiver.Name);
+            InvalidateConnection();
+            return;
+        }
+
+        var launchStatus = await launchTask.ConfigureAwait(false);
+        var transportId = launchStatus?.Application?.TransportId;
+        if (transportId is null)
+        {
+            _logger.LogWarning("Chromecast {Name} did not report a running application after launch - aborting cast", _receiver.Name);
+            return;
+        }
+
+        _appTransportId = transportId;
 
         var options = new PlayNowOptions
         {
-            Items = items,
+            // PascalCase, matching Jellyfin's normal API casing - see the XML doc on
+            // PlayNowOptions.Items for why this must not go through the envelope's camelCase
+            // serializer options.
+            Items = items.Select(item => JsonSerializer.SerializeToElement(item, ApiJsonOptions)).ToList(),
             StartPositionTicks = command.StartPositionTicks,
             MediaSourceId = command.MediaSourceId,
             AudioStreamIndex = command.AudioStreamIndex,
             SubtitleStreamIndex = command.SubtitleStreamIndex
         };
 
-        await _connectSdkChannel.SendCommandAsync("PlayNow", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, options).ConfigureAwait(false);
+        await _connectSdkChannel.SendCommandAsync("PlayNow", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, options, transportId).ConfigureAwait(false);
     }
 
     private async Task SendPlaystateCommand(PlaystateRequest? command, CancellationToken cancellationToken)
@@ -191,44 +259,52 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             return;
         }
 
-        switch (command.Command)
+        try
         {
-            case PlaystateCommand.Stop:
-                await SendReceiverCommandAsync("Stop", null).ConfigureAwait(false);
-                await RevokeAccessTokenAsync().ConfigureAwait(false);
-                break;
-            case PlaystateCommand.Pause:
-                await SendReceiverCommandAsync("Pause", null).ConfigureAwait(false);
-                break;
-            case PlaystateCommand.Unpause:
-                await SendReceiverCommandAsync("Unpause", null).ConfigureAwait(false);
-                break;
-            case PlaystateCommand.PlayPause:
-                await SendReceiverCommandAsync("PlayPause", null).ConfigureAwait(false);
-                break;
-            case PlaystateCommand.Seek:
-                await SendReceiverCommandAsync("Seek", new SeekOptions { Position = (command.SeekPositionTicks ?? 0) / 10_000_000d }).ConfigureAwait(false);
-                break;
-            case PlaystateCommand.NextTrack:
-                await SendReceiverCommandAsync("NextTrack", null).ConfigureAwait(false);
-                break;
-            case PlaystateCommand.PreviousTrack:
-                await SendReceiverCommandAsync("PreviousTrack", null).ConfigureAwait(false);
-                break;
-            default:
-                _logger.LogDebug("Playstate command {Command} is not supported for Chromecast sessions", command.Command);
-                break;
+            switch (command.Command)
+            {
+                case PlaystateCommand.Stop:
+                    await SendReceiverCommandAsync("Stop", null).ConfigureAwait(false);
+                    await RevokeAccessTokenAsync().ConfigureAwait(false);
+                    break;
+                case PlaystateCommand.Pause:
+                    await SendReceiverCommandAsync("Pause", null).ConfigureAwait(false);
+                    break;
+                case PlaystateCommand.Unpause:
+                    await SendReceiverCommandAsync("Unpause", null).ConfigureAwait(false);
+                    break;
+                case PlaystateCommand.PlayPause:
+                    await SendReceiverCommandAsync("PlayPause", null).ConfigureAwait(false);
+                    break;
+                case PlaystateCommand.Seek:
+                    await SendReceiverCommandAsync("Seek", new SeekOptions { Position = (command.SeekPositionTicks ?? 0) / 10_000_000d }).ConfigureAwait(false);
+                    break;
+                case PlaystateCommand.NextTrack:
+                    await SendReceiverCommandAsync("NextTrack", null).ConfigureAwait(false);
+                    break;
+                case PlaystateCommand.PreviousTrack:
+                    await SendReceiverCommandAsync("PreviousTrack", null).ConfigureAwait(false);
+                    break;
+                default:
+                    _logger.LogDebug("Playstate command {Command} is not supported for Chromecast sessions", command.Command);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error sending playstate command {Command} to Chromecast {Name}", command.Command, _receiver.Name);
+            InvalidateConnection();
         }
     }
 
     private Task SendReceiverCommandAsync(string command, object? options)
     {
-        if (_connectSdkChannel is null || _mintedAccessToken is null)
+        if (_connectSdkChannel is null || _mintedAccessToken is null || _appTransportId is null)
         {
             return Task.CompletedTask;
         }
 
-        return _connectSdkChannel.SendCommandAsync(command, _session.UserId, _mintedAccessToken, _serverAddress, _receiver.Name, options);
+        return _connectSdkChannel.SendCommandAsync(command, _session.UserId, _mintedAccessToken, _serverAddress, _receiver.Name, options, _appTransportId);
     }
 
     private Task SendGeneralCommand(GeneralCommand? command, CancellationToken cancellationToken)
@@ -465,6 +541,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         var client = _client;
         _client = null;
         _connectSdkChannel = null;
+        _appTransportId = null;
 
         if (client is not null)
         {

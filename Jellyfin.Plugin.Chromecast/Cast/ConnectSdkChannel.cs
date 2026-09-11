@@ -44,7 +44,15 @@ public sealed class ConnectSdkChannel(ILogger<ConnectSdkChannel> logger)
     /// <param name="serverAddress">The base URL of the Jellyfin server, reachable from the receiver.</param>
     /// <param name="receiverName">A friendly name for the receiver to report itself as.</param>
     /// <param name="options">The command-specific payload (e.g. <see cref="PlayNowOptions"/>).</param>
-    public Task SendCommandAsync(string command, Guid userId, string accessToken, string serverAddress, string receiverName, object? options)
+    /// <param name="transportId">
+    /// The running application's transport id (from the LaunchApplicationAsync/status response's
+    /// <c>Application.TransportId</c>). CastV2 messages default to the "receiver-0" platform
+    /// destination, which only the receiver *platform* listens on - a message meant for the
+    /// running app (which is what the Jellyfin cast receiver is) is silently dropped unless it is
+    /// addressed to that app's own transport id instead. SharpCaster's own <c>MediaChannel</c>
+    /// does the same for every message it sends.
+    /// </param>
+    public Task SendCommandAsync(string command, Guid userId, string accessToken, string serverAddress, string receiverName, object? options, string transportId)
     {
         var envelope = new
         {
@@ -56,12 +64,15 @@ public sealed class ConnectSdkChannel(ILogger<ConnectSdkChannel> logger)
             options = options ?? new { }
         };
 
-        return SendAsync(JsonSerializer.Serialize(envelope, SerializerOptions));
+        var json = JsonSerializer.Serialize(envelope, SerializerOptions);
+        Logger?.LogDebug("connectsdk -> {TransportId}: {Json}", transportId, json);
+        return SendAsync(json, transportId);
     }
 
     /// <inheritdoc />
     public override void OnMessageReceived(string messagePayload, string type)
     {
+        Logger?.LogDebug("connectsdk <- (type={Type}): {Message}", type, messagePayload);
         try
         {
             var status = JsonSerializer.Deserialize<ConnectSdkStatusMessage>(messagePayload, SerializerOptions);
