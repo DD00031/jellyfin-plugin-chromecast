@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data;
@@ -40,8 +41,28 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     /// <summary>The "unstable" build of Jellyfin's own cast receiver.</summary>
     private const string UnstableReceiverAppId = "6F511C87";
 
-    /// <summary>Matches Jellyfin API JSON casing (PascalCase) for the inner status payload.</summary>
-    private static readonly JsonSerializerOptions ApiJsonOptions = new();
+    /// <summary>
+    /// Matches Jellyfin API JSON casing (PascalCase) for the inner status payload. Two converters
+    /// were needed to stop every single incoming status broadcast from failing to deserialize into
+    /// <see cref="PlaybackProgressInfo"/> (confirmed by testing: "Could not parse playback status"
+    /// logged for every progress update, silently preventing this session's own
+    /// OnPlaybackStart/Progress from ever firing - which is also why the "Play On" remote control
+    /// UI never showed the now-playing title/artwork for this session, even while the receiver's
+    /// own separate, direct API reporting kept working fine):
+    /// <list type="bullet">
+    /// <item><see cref="JsonStringEnumConverter"/> - the receiver writes enums as strings (e.g.
+    /// <c>"PlayMethod":"Transcode"</c>), which the default numeric enum handling rejects.</item>
+    /// <item><see cref="FlexibleGuidConverter"/> - the receiver's own internal reporting writes
+    /// item ids in Jellyfin's dashless "N" format (e.g. <c>"b565cf7176b943ceb165fece9b26181f"</c>),
+    /// which <c>System.Text.Json</c>'s built-in <c>Guid</c> converter rejects outright - it only
+    /// accepts the canonical dashed format, unlike the more permissive <c>Guid.Parse(string)</c>.
+    /// </item>
+    /// </list>
+    /// </summary>
+    private static readonly JsonSerializerOptions ApiJsonOptions = new()
+    {
+        Converters = { new JsonStringEnumConverter(), new FlexibleGuidConverter() }
+    };
 
     private readonly SessionInfo _session;
     private readonly ISessionManager _sessionManager;
@@ -652,5 +673,25 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }
 
         _connectLock.Dispose();
+    }
+}
+
+/// <summary>
+/// <c>System.Text.Json</c>'s built-in <see cref="Guid"/> converter only accepts the canonical
+/// dashed format - Jellyfin's own dashless "N" format (as used internally, including by the cast
+/// receiver's own status reporting) fails to parse with it. <c>Guid.Parse(string)</c>
+/// itself already handles both (and more), so this just delegates to that instead.
+/// </summary>
+internal sealed class FlexibleGuidConverter : JsonConverter<Guid>
+{
+    public override Guid Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var value = reader.GetString();
+        return string.IsNullOrEmpty(value) ? Guid.Empty : Guid.Parse(value);
+    }
+
+    public override void Write(Utf8JsonWriter writer, Guid value, JsonSerializerOptions options)
+    {
+        writer.WriteStringValue(value.ToString());
     }
 }
