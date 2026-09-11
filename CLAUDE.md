@@ -398,7 +398,7 @@ real hardware post-fix: seeking a ~592s video to 3:00 landed correctly at 3:00, 
 forward/back buttons route through the same `Seek` command, so should be fixed too, though not yet
 explicitly re-tested with real button presses (only via direct `SeekPositionTicks` API calls).
 
-### Two Jellyfin sessions exist per cast - investigate if this causes user-visible confusion
+### Two Jellyfin sessions exist per cast (not a bug - documented for context)
 
 Every cast currently creates **two** separate Jellyfin sessions for the same physical device:
 1. This plugin's own synthetic `SessionInfo` (`DeviceId: chromecast-<hash>`,
@@ -413,24 +413,25 @@ Every cast currently creates **two** separate Jellyfin sessions for the same phy
    real, independently-authenticated Jellyfin client making its own API calls (which is
    deliberate - see "The actual design" above for why).
 
-This is architecturally inherent, not obviously a bug to fix outright - Chrome's own official
-casting flow has exactly the same duality (the receiver has always created its own session there
-too), it's just invisible normally because Chrome's cast icon never relied on Jellyfin's own
-session list at all. The user reported not being able to "pick up" an in-progress cast (started
-from their phone) when later opening the Jellyfin app on their Mac and selecting the same
-Chromecast - **this may already be substantially improved by the parsing fix above**, since before
-it, session #1 (the one any client actually looks at/controls) had no live state to show at all,
-which would look exactly like "nothing is playing here" to a client trying to join. Not yet
-re-tested specifically after the fix - worth confirming whether it's fully resolved or still needs
-attention (e.g. deciding whether these two sessions should somehow be merged/deduplicated in the
-UI, which would need investigating what jellyfin-web/the mobile apps actually key off when
-deciding "this device already has an active session, show remote controls instead of a fresh
-cast").
+Architecturally inherent, not a bug to fix outright - Chrome's own official casting flow has
+exactly the same duality (the receiver has always created its own session there too), it's just
+invisible normally because Chrome's cast icon never relied on Jellyfin's own session list at all.
+Both sessions now correctly show live, matching `NowPlayingItem`/`PlayState` after the parsing fix
+above (confirmed side by side in the `/Sessions` API during testing).
+
+### RESOLVED: "pick up an in-progress cast from a second client" didn't work
+
+This was the same root cause as the parsing bug above, confirmed by a real multi-device test: cast
+something from the phone, confirm via `/Sessions` that this plugin's own session (`#1` above) has
+correct live state, then open the Mac's Jellyfin app and select the same Chromecast - **it now
+correctly shows the remote-control screen with the in-progress item already loaded**, instead of
+prompting to start something new. Before the parsing fix, session #1 (the one any client actually
+queries/joins) had no live state to show at all, which looked indistinguishable from "nothing is
+playing here" to a client trying to join. No code changes were needed beyond the parsing fix
+already committed.
 
 ### Still open
 
-- Re-test the "pick up an existing cast from a second client" scenario now that session #1's
-  state is no longer empty (see above).
 - Explicitly re-test the skip forward/back buttons via real button presses (not just direct
   `SeekPositionTicks` API calls) and volume/mute (user reports these already work well, but not
   re-verified after this round of fixes - should be unaffected either way).
