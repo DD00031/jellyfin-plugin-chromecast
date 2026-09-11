@@ -38,6 +38,9 @@
     <PackageReference Include="Jellyfin.Model" Version="$(JellyfinServerVersion)">
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>
+    <PackageReference Include="Jellyfin.Data" Version="$(JellyfinServerVersion)">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
   </ItemGroup>
 
   <ItemGroup>

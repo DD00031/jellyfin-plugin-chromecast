@@ -4,9 +4,12 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Data;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Plugin.Chromecast.Cast;
 using Jellyfin.Plugin.Chromecast.Configuration;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
@@ -269,7 +272,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
     private async Task<(string? AccessToken, User? User)> MintAccessTokenAsync(User? user, CancellationToken cancellationToken)
     {
-        user ??= _userManager.Users.FirstOrDefault(u => u.HasPermission(MediaBrowser.Model.Users.PermissionKind.IsAdministrator));
+        user ??= _userManager.GetUsers().FirstOrDefault(u => u.HasPermission(PermissionKind.IsAdministrator));
         if (user is null)
         {
             _logger.LogError("Cannot cast: no controlling user and no administrator fallback available");

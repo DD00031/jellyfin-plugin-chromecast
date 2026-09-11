@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.Chromecast.Configuration;
 using Jellyfin.Plugin.Chromecast.Session;
 using MediaBrowser.Controller;
@@ -180,7 +181,7 @@ public sealed class ChromecastDiscoveryManager : IDisposable
 
         sessionInfo.AddController(controller);
 
-        _sessionManager.ReportCapabilities(sessionInfo.Id, new ClientCapabilities
+        _sessionManager.ReportCapabilities(sessionInfo.Id, sessionInfo.Id, new ClientCapabilities
         {
             PlayableMediaTypes = new[] { MediaType.Video, MediaType.Audio },
             SupportedCommands = new[]
