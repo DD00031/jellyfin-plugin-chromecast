@@ -218,53 +218,49 @@ an extension method (`Jellyfin.Data.UserEntityExtensions.HasPermission`) against
 `Jellyfin.Database.Implementations.Enums.PermissionKind`; `ISessionManager.ReportCapabilities`
 gained a second (controlling) session id parameter.
 
-**Not yet verified:** the plugin has not been loaded into an actual running Jellyfin server yet
-(the test instance is still 10.11.6 - see below), and a full cast has never been attempted.
+**Not yet verified against a live device:** a full cast has never been attempted. The test Jellyfin
+instance is now on 12.0, so plugin-loading can be verified locally, but live Chromecast
+network testing cannot happen on this macOS dev machine (see below) - it needs a Linux box.
 
-### Chromecast discovery: works at the OS level, not yet from .NET on this dev machine
+### Chromecast network testing does not work on macOS - use Linux instead
 
-Confirmed the target Chromecast is discoverable via macOS's native `dns-sd -B _googlecast._tcp
-local.` - found immediately. But a standalone test using both SharpCaster's `ChromecastLocator`
-*and* the raw `Zeroconf` NuGet package directly (bypassing our code entirely) found nothing, even
-with a generous 10s timeout. This points to something rejecting/dropping multicast for .NET-built
-binaries specifically on this machine - possibly macOS's Local Network privacy permission (TCC)
-not being granted to the ad-hoc-signed `dotnet build` output (each rebuild can produce a "new"
-unrecognized binary identity, unlike a stable, already-approved app), or another local
-socket/entitlement restriction. The user confirmed the test Jellyfin server is a **native macOS
-install on this same machine** (not Docker), so this isn't a container-networking problem, but it
-does mean whatever is blocking .NET's multicast here could plausibly also affect the real
-`jellyfin` server process once the plugin is loaded into it - this needs to be re-tested against
-the actual server, not just a throwaway console app, before concluding anything. Worth checking:
-System Settings → Privacy & Security → Local Network for an entry for `dotnet`/`jellyfin`/Terminal
-that needs enabling.
-
-If this turns out to be a genuine, unfixable-from-inside-the-process macOS restriction (unlikely
-for an unsandboxed native install, but not yet ruled out), a fallback worth considering is
-shelling out to `dns-sd`/`avahi-browse` as an alternative discovery mechanism - but do not reach
-for that until discovery is actually confirmed broken *inside the real Jellyfin server process*,
-since this dev-machine console-app test may simply not be representative.
+Extensively diagnosed on this dev Mac: macOS's native `dns-sd` tool finds and resolves the target
+Chromecast immediately (mDNS browse *and* direct TCP connect both confirmed reachable at the OS
+level - device is `192.168.2.2:8009`, friendly name "Woonkamer TV"). But from .NET - both
+SharpCaster's `ChromecastLocator`/raw `Zeroconf` (mDNS) *and* a plain `TcpClient` connect straight
+to that IP (no mDNS involved at all) - everything fails ("No route to host" on direct connect,
+zero results on discovery). Ruled out: LuLu firewall (checked, no blocked-connection log entries),
+Tailscale/VPN (disabled, no change), and the user's own Jellyfin.app Info.plist as a fixable cause
+(it lacks `NSBonjourServices`, which would explain mDNS-only failures, but not the direct-IP
+`TcpClient` failure too - and editing it turned out to be blocked by macOS's App Management
+protection anyway, which is moot since **the user's actual production Jellyfin server runs on a
+separate, non-macOS machine** - this was purely a dev-machine testing inconvenience, not a
+real deployment concern). Net effect: something in this specific macOS environment blocks
+outbound local-network connections from .NET processes at a level deeper than app-level
+permissions, and it is *not worth further debugging* - the user hit the same class of problem
+with the previous `jellycast` prototype and worked around it by testing on a Debian machine
+instead. **Do the same here: do all live-device testing (discovery, casting, playback) on a
+Linux box, not this Mac.** Plugin loading, DI wiring, and anything not requiring an actual network
+round-trip to the Chromecast can still be verified locally on macOS in the meantime.
 
 ### Next steps, in order
 
-1. **The test Jellyfin instance is currently running 10.11.6, not 12.0.** A 12.0-targeted plugin's
-   assembly version requirements mean it will not load there at all (see the `JellyfinServerVersion`
-   comment in the `.csproj` - Jellyfin plugin assemblies aren't forward/backward compatible across
-   server versions). The user needs to upgrade that instance before the plugin can be loaded and
-   tested end-to-end; flagged, not yet resolved as of this writing.
-2. An API key for the test instance (`http://192.168.2.14:8096`) was provided during development
-   for diagnostics. **Do not commit it to this repo** - treat it as a local secret only.
-3. Once on 12.0: install the plugin, confirm it loads (check the server log for the
-   `PluginServiceRegistrator`/`ChromecastHost` startup messages), and confirm discovery actually
-   finds the Chromecast from inside the real server process.
-4. Then: verify a cast actually starts the receiver and plays back, verify an H.265 source
-   transcodes correctly, verify play/pause/seek/stop/volume all round-trip correctly, verify the
-   minted access token is revoked on stop.
-5. Still worth confirming once real casting works: exact JSON field casing Jellyfin's API uses for
+1. Verify the plugin loads cleanly in the local (now-12.0) Jellyfin server: check the server log
+   for `PluginServiceRegistrator`/`ChromecastHost` startup messages, confirm no load errors, and
+   confirm the Dashboard → Plugins config page renders correctly. This is testable locally on
+   macOS right now - it doesn't touch the network.
+2. All live-device testing (discovery finds the real Chromecast, a cast actually starts the
+   receiver and plays back, an H.265 source transcodes correctly, play/pause/seek/stop/volume all
+   round-trip correctly, the minted access token is revoked on stop) needs to happen on a Linux
+   Jellyfin instance - see the "does not work on macOS" note above.
+3. Still worth confirming once real casting works: exact JSON field casing Jellyfin's API uses for
    `PlaybackProgressInfo` in the connectsdk status broadcasts (assumed PascalCase, matching .NET's
    default `System.Text.Json` behavior - not yet confirmed against a live wire capture), and that
    `F007D354`/`6F511C87` are launchable by an arbitrary CastV2 sender (should be, per Google's
    "Custom application" registration model having no sender allowlist, but blocked on discovery
    working first to actually reach a device to launch on).
+4. An API key for the test instance (`http://192.168.2.14:8096`) was provided during development
+   for diagnostics. **Do not commit it to this repo** - treat it as a local secret only.
 
 ## Building
 

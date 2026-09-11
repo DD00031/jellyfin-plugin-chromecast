@@ -18,6 +18,16 @@
       jellycast prototype - see CLAUDE.md.)
     -->
     <CopyLocalRuntimeTargetAssets>false</CopyLocalRuntimeTargetAssets>
+    <!--
+      A class library (which is what a Jellyfin plugin is - there's no separate "publish" step
+      that flattens dependencies the way an app gets) only copies its *direct* package references
+      to its own output folder by default, not the full transitive closure. Sharpcaster's own
+      dependencies (Zeroconf, Google.Protobuf, System.Reactive, ...) were silently missing from
+      the plugin folder without this - confirmed by testing an actual deployment, where discovery
+      failed at runtime with no immediately obvious error until checking which assemblies were
+      actually present.
+    -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <!--
@@ -67,13 +77,13 @@
     and disables the whole plugin. Jellyfin's host always provides these packages itself, so strip
     any copies after publish and let the plugin load context fall through to the host's.
   -->
-  <Target Name="RemoveHostProvidedAssemblies" AfterTargets="Publish">
+  <Target Name="RemoveHostProvidedAssemblies" AfterTargets="Build;Publish">
     <ItemGroup>
-      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.DependencyInjection.dll" />
-      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.DependencyInjection.Abstractions.dll" />
-      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.Logging.Abstractions.dll" />
-      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.Logging.dll" />
-      <_HostProvidedAssembly Include="$(PublishDir)Microsoft.Extensions.Options.dll" />
+      <_HostProvidedAssembly Include="$(TargetDir)Microsoft.Extensions.DependencyInjection.dll" />
+      <_HostProvidedAssembly Include="$(TargetDir)Microsoft.Extensions.DependencyInjection.Abstractions.dll" />
+      <_HostProvidedAssembly Include="$(TargetDir)Microsoft.Extensions.Logging.Abstractions.dll" />
+      <_HostProvidedAssembly Include="$(TargetDir)Microsoft.Extensions.Logging.dll" />
+      <_HostProvidedAssembly Include="$(TargetDir)Microsoft.Extensions.Options.dll" />
     </ItemGroup>
     <Delete Files="@(_HostProvidedAssembly)" Condition="Exists('%(_HostProvidedAssembly.Identity)')" />
   </Target>
