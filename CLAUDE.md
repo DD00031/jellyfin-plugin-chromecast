@@ -218,49 +218,134 @@ an extension method (`Jellyfin.Data.UserEntityExtensions.HasPermission`) against
 `Jellyfin.Database.Implementations.Enums.PermissionKind`; `ISessionManager.ReportCapabilities`
 gained a second (controlling) session id parameter.
 
-**Not yet verified against a live device:** a full cast has never been attempted. The test Jellyfin
-instance is now on 12.0, so plugin-loading can be verified locally, but live Chromecast
-network testing cannot happen on this macOS dev machine (see below) - it needs a Linux box.
+**Casting is confirmed working end-to-end against real hardware**, including the core goal of this
+whole project: an H.265/HEVC source correctly transcodes to H.264 server-side and plays back
+successfully on a real 2015-era Chromecast. Verified by casting to two real devices ("Woonkamer
+TV", "Eettafel TV") from the local (now 12.0) test Jellyfin server on the user's Mac. Both a plain
+H.264 item and an HEVC item were cast, watched playing on the actual TV, and confirmed via the
+`/Sessions` API (`PlayMethod: Transcode`, advancing `PositionTicks`, correct ffmpeg
+`-codec:v:0 libx264` invocation for the HEVC source - visible in the server log).
 
-### Chromecast network testing does not work on macOS - use Linux instead
+### Bugs found only by testing against a real device (not catchable by compiling alone)
 
-Extensively diagnosed on this dev Mac: macOS's native `dns-sd` tool finds and resolves the target
-Chromecast immediately (mDNS browse *and* direct TCP connect both confirmed reachable at the OS
-level - device is `192.168.2.2:8009`, friendly name "Woonkamer TV"). But from .NET - both
-SharpCaster's `ChromecastLocator`/raw `Zeroconf` (mDNS) *and* a plain `TcpClient` connect straight
-to that IP (no mDNS involved at all) - everything fails ("No route to host" on direct connect,
-zero results on discovery). Ruled out: LuLu firewall (checked, no blocked-connection log entries),
-Tailscale/VPN (disabled, no change), and the user's own Jellyfin.app Info.plist as a fixable cause
-(it lacks `NSBonjourServices`, which would explain mDNS-only failures, but not the direct-IP
-`TcpClient` failure too - and editing it turned out to be blocked by macOS's App Management
-protection anyway, which is moot since **the user's actual production Jellyfin server runs on a
-separate, non-macOS machine** - this was purely a dev-machine testing inconvenience, not a
-real deployment concern). Net effect: something in this specific macOS environment blocks
-outbound local-network connections from .NET processes at a level deeper than app-level
-permissions, and it is *not worth further debugging* - the user hit the same class of problem
-with the previous `jellycast` prototype and worked around it by testing on a Debian machine
-instead. **Do the same here: do all live-device testing (discovery, casting, playback) on a
-Linux box, not this Mac.** Plugin loading, DI wiring, and anything not requiring an actual network
-round-trip to the Chromecast can still be verified locally on macOS in the meantime.
+1. **CastV2 messages must target the launched app's transport id, not "receiver-0".** The default
+   CastV2 destination (`Sharpcaster.DefaultIdentifiers.DESTINATION_ID = "receiver-0"`) is the
+   platform-level channel; a message meant for the *running app* (our launched receiver) is
+   silently dropped unless addressed to that app's own `TransportId` from the launch/status
+   response. SharpCaster's own `MediaChannel` always does this; the connectsdk channel didn't.
+   Fixed by threading `transportId` through `ConnectSdkChannel.SendCommandAsync` and
+   `ChromecastSessionController` (captured from `LaunchApplicationAsync`'s response, stored in
+   `_appTransportId`, cleared on disconnect/invalidate).
+2. **Mixed JSON casing requirement.** The outer connectsdk envelope and `PlayRequest`-shaped
+   options (`command`, `userId`, `startPositionTicks`, `mediaSourceId`, ...) are camelCase (plain
+   JS/TS convention), but the nested `items` array must stay in Jellyfin's native PascalCase - the
+   receiver reads each one as a genuine `BaseItemDto`, identical to a real `GET /Items` response.
+   Serializing everything through one camelCase `JsonSerializerOptions` silently renamed every
+   field on every item, and the receiver just never got usable metadata (no error, no crash - it
+   would have failed some `item.Name`/`item.Id`-style property access client-side with nothing
+   reported back over connectsdk). Fixed by pre-serializing each item to a `JsonElement` with
+   default (PascalCase) options before it goes into the outer camelCase envelope - a `JsonElement`
+   already embedded in the object tree is written out verbatim, bypassing the outer naming policy.
+3. **Uncaught exceptions inside `SendPlayCommand`/`SendPlaystateCommand` vanish silently.**
+   Jellyfin's `SessionManager` does not appear to await/observe the `Task` an `ISessionController`
+   returns (commands are presumably broadcast to every session controller without waiting on each
+   one individually) - a fault thrown from either method disappears with **no log output
+   whatsoever**, which is exactly what turned a real, later-confirmed exception (a write to a dead
+   `SslStream`) into what looked for a long time like a total, unexplainable silent hang. Both
+   methods now wrap their core logic in try/catch and log any exception explicitly. **Any
+   `ISessionController` method that does real I/O should assume its return value is never
+   observed by the caller and must handle/log its own failures.**
+4. **No timeout on SharpCaster's request/response matching.** `WaitingTasks` (keyed by CastV2
+   `requestId`) has no built-in timeout - if a response never arrives, the awaiting call hangs
+   forever with no exception. `LaunchApplicationAsync` is now wrapped with an explicit 10s
+   `Task.WhenAny`-based timeout.
+5. **A failed send should invalidate the cached connection, not just log and move on** - otherwise
+   every subsequent command keeps failing against the same known-dead `ChromecastClient`. Added
+   `InvalidateConnection()` (nulls `_client`/`_connectSdkChannel`/`_appTransportId`), called from
+   every catch block that touches the network. A fresh `SendPlayCommand` afterwards correctly
+   reconnects and relaunches from scratch (confirmed).
+6. **Class library projects don't copy-local their full transitive dependency closure by
+   default** - only apps do. A plain `dotnet build` of this plugin was silently missing
+   `Zeroconf.dll`/`Google.Protobuf.dll`/`System.Reactive.dll` (Sharpcaster's own dependencies,
+   pulled in via the vendored `ProjectReference`) from the output folder, discovered only by
+   actually deploying and checking the plugin folder contents against the server log's "Loaded
+   assembly" lines. Fixed with `<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>`
+   in the plugin `.csproj`.
 
-### Next steps, in order
+### Known follow-up issue: the CastV2 control connection doesn't reliably survive between commands
 
-1. Verify the plugin loads cleanly in the local (now-12.0) Jellyfin server: check the server log
-   for `PluginServiceRegistrator`/`ChromecastHost` startup messages, confirm no load errors, and
-   confirm the Dashboard → Plugins config page renders correctly. This is testable locally on
-   macOS right now - it doesn't touch the network.
-2. All live-device testing (discovery finds the real Chromecast, a cast actually starts the
-   receiver and plays back, an H.265 source transcodes correctly, play/pause/seek/stop/volume all
-   round-trip correctly, the minted access token is revoked on stop) needs to happen on a Linux
-   Jellyfin instance - see the "does not work on macOS" note above.
-3. Still worth confirming once real casting works: exact JSON field casing Jellyfin's API uses for
-   `PlaybackProgressInfo` in the connectsdk status broadcasts (assumed PascalCase, matching .NET's
-   default `System.Text.Json` behavior - not yet confirmed against a live wire capture), and that
-   `F007D354`/`6F511C87` are launchable by an arbitrary CastV2 sender (should be, per Google's
-   "Custom application" registration model having no sender allowlist, but blocked on discovery
-   working first to actually reach a device to launch on).
-4. An API key for the test instance (`http://192.168.2.14:8096`) was provided during development
-   for diagnostics. **Do not commit it to this repo** - treat it as a local secret only.
+After a successful cast, a `Pause` sent even a short while later (tens of seconds) can fail with
+the same "dead `SslStream`" write error described above. **Playback itself is unaffected** -
+confirmed by asking the user to check the TV, which kept playing normally - because the receiver
+runs its own HLS playback independently via its own HTTP requests to Jellyfin, completely separate
+from this plugin's CastV2 control channel. Only the *ability to send further commands* (pause,
+seek, stop, volume) is affected until a fresh `SendPlayCommand` reconnects. Root cause not yet
+found - candidates: `Sharpcaster.Channels.HeartbeatChannel` not actually keeping the connection
+alive (there's an existing nullability warning on its timer callback worth looking at first), or
+the Chromecast itself closing idle CastV2 connections faster than expected. `SendPlaystateCommand`
+also does not currently attempt to reconnect on its own the way `SendPlayCommand` does (it just
+no-ops via its `_connectSdkChannel is null` guard) - worth deciding whether pause/seek/stop should
+trigger a reconnect-and-rejoin, though there's nothing meaningful to reconnect *to* without
+re-deriving the running app's transport id, which would need a `ChromecastStatus` query after
+reconnecting rather than a fresh launch.
+
+### macOS-specific testing gotchas (irrelevant to real deployment, but costly if hit again)
+
+- **`/System/Restart` (the REST API and Dashboard "Restart" button) is an in-process soft restart
+  on this platform/build, not a real process restart.** The `jellyfin` OS process keeps the same
+  PID across it. This matters enormously for plugin development: swapping the plugin `.dll` in the
+  filesystem and hitting "Restart" does *not* replace already-instantiated long-lived objects like
+  an existing `ChromecastSessionController` for an already-known device - `ISessionManager`'s
+  session list is not cleared by a soft restart, so an old session just gets `UpdateReceiver`
+  called on it forever, keeping the code and captured state from whenever it was first created.
+  This produced a very confusing multi-hour debugging detour that looked like a mysterious silent
+  hang with no explanation, when the actual code was fine and just wasn't running. **To actually
+  test a new build, kill the real OS process and relaunch the app - don't rely on `/System/Restart`:**
+  ```bash
+  CURPID=$(ps aux | grep "jellyfin --webdir" | grep -v grep | awk '{print $2}')
+  kill "$CURPID"   # if this leaves an orphaned "Jellyfin Server" wrapper process, `pkill -f Jellyfin` instead
+  open -a "/Applications/Jellyfin.app"
+  ```
+- Chromecast **discovery** specifically (mDNS/Zeroconf, and even a bare `TcpClient` connect) does
+  *not* work from an ad-hoc-signed standalone `dotnet run`/`dotnet build` console binary on this
+  Mac, even though native tools (`dns-sd`) and - critically - **the real, properly-installed
+  `Jellyfin.app` process itself** can reach the same devices without issue. If you need a
+  standalone repro outside the actual plugin, this will waste your time; it did here (a long
+  detour through macOS Local Network/TCC permissions and Info.plist `NSBonjourServices` theories
+  that were ultimately irrelevant - the real Jellyfin server was never actually affected). Test
+  inside the real plugin/server instead of a scratch console app.
+- Binary string-searching a compiled `.dll` to verify what code shipped (`strings -a`, or a raw
+  UTF-16LE decode) is **not reliable** for confirming build content one way or the other on this
+  toolchain/version - several genuinely-present, plainly-literal strings didn't turn up under
+  either method for reasons never fully explained (not an encoding issue - a proper UTF-16LE
+  decode was tried too). Use a real behavioral signal instead - a raw `File.AppendAllText` probe
+  actually invoked at runtime (as a last resort; remove it once done) is far more trustworthy than
+  inspecting the assembly's bytes.
+- Also worth knowing: `dotnet build-server shutdown` exists and stops the persistent Roslyn/MSBuild
+  compiler server process, in case of *actual* stale-incremental-build suspicions (this was tried
+  during the same debugging detour above; it turned out not to be the cause that time, but is a
+  reasonable thing to reach for if a rebuild seems to not be taking effect).
+
+### An API key was used for local testing - do not commit it
+
+An API key for the local test instance (`http://192.168.2.14:8096`) was used during this session
+for diagnostics and for driving test casts via the REST API directly. It is not stored in this
+repo and must never be committed - treat any such key as a local secret only.
+
+### Remaining before this is a real release
+
+- Root-cause and fix the control-connection-longevity issue above.
+- Decide whether `SendPlaystateCommand` should attempt to reconnect on failure.
+- Confirm the exact JSON field casing of `PlaybackProgressInfo` inside connectsdk status
+  broadcasts against a live wire capture (assumed PascalCase and this has worked in every test so
+  far, but never explicitly logged/verified byte-for-byte).
+- Test seek, stop (including confirming the minted access token is actually revoked - the code
+  path exists and calls `ISessionManager.Logout`, but hasn't been explicitly confirmed by checking
+  for the token disappearing), volume/mute, and multi-item queue playback (`NextTrack`).
+- Test from an actual iOS/iPadOS/macOS Jellyfin client's cast UI, not just direct REST API calls -
+  confirm the device actually appears in and is controllable from the real "Play On" interface.
+- Clean up the `NU1510` NuGet warnings in the vendored `Sharpcaster.csproj` (harmless, low
+  priority).
 
 ## Building
 
