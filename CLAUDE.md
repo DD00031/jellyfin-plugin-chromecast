@@ -209,31 +209,62 @@ external/Sharpcaster/                         - vendored + patched SharpCaster (
 
 ## Current status (as of this writing)
 
-Everything above is written but **has not yet compiled or been tested against a live server or
-device.** Next steps, in order:
+**The plugin builds successfully** against real Jellyfin.Controller/Model/Data 12.0.0 packages
+(`dotnet build Jellyfin.Plugin.Chromecast/Jellyfin.Plugin.Chromecast.csproj`). Several API surfaces
+changed from what the pre-EF-Core-rewrite `jellycast` prototype assumed - resolved by decompiling
+the actual 12.0 NuGet packages rather than guessing (see git log for specifics): `MediaType` moved
+to `Jellyfin.Data.Enums`; `User.HasPermission`/`IsAdministrator` is no longer a direct member but
+an extension method (`Jellyfin.Data.UserEntityExtensions.HasPermission`) against
+`Jellyfin.Database.Implementations.Enums.PermissionKind`; `ISessionManager.ReportCapabilities`
+gained a second (controlling) session id parameter.
 
-1. .NET 10 SDK needs installing on the dev machine (`brew install --cask dotnet-sdk` - this
-   requires an interactive sudo password prompt, so it has to be run by the user, not from here).
-2. First `dotnet build` pass - expect to need small fixes; several API surfaces were verified by
-   reading actual source/decompiled metadata (noted inline in code comments where relevant) but
-   have not been compiler-checked yet. Specifically worth double-checking on first build:
-   - Exact JSON field casing Jellyfin's API uses for `PlaybackProgressInfo` (assumed PascalCase,
-     matching .NET's default `System.Text.Json` behavior and observed via decompiled metadata
-     strings - but not confirmed against a live wire capture).
-   - Whether `F007D354`/`6F511C87` are actually launchable by an arbitrary CastV2 sender (should
-     be, per Google's "Custom application" registration model having no sender allowlist - but
-     unverified against a real device).
-3. **The test Jellyfin instance is currently running 10.11.6, not 12.0.** A 12.0-targeted plugin's
+**Not yet verified:** the plugin has not been loaded into an actual running Jellyfin server yet
+(the test instance is still 10.11.6 - see below), and a full cast has never been attempted.
+
+### Chromecast discovery: works at the OS level, not yet from .NET on this dev machine
+
+Confirmed the target Chromecast is discoverable via macOS's native `dns-sd -B _googlecast._tcp
+local.` - found immediately. But a standalone test using both SharpCaster's `ChromecastLocator`
+*and* the raw `Zeroconf` NuGet package directly (bypassing our code entirely) found nothing, even
+with a generous 10s timeout. This points to something rejecting/dropping multicast for .NET-built
+binaries specifically on this machine - possibly macOS's Local Network privacy permission (TCC)
+not being granted to the ad-hoc-signed `dotnet build` output (each rebuild can produce a "new"
+unrecognized binary identity, unlike a stable, already-approved app), or another local
+socket/entitlement restriction. The user confirmed the test Jellyfin server is a **native macOS
+install on this same machine** (not Docker), so this isn't a container-networking problem, but it
+does mean whatever is blocking .NET's multicast here could plausibly also affect the real
+`jellyfin` server process once the plugin is loaded into it - this needs to be re-tested against
+the actual server, not just a throwaway console app, before concluding anything. Worth checking:
+System Settings → Privacy & Security → Local Network for an entry for `dotnet`/`jellyfin`/Terminal
+that needs enabling.
+
+If this turns out to be a genuine, unfixable-from-inside-the-process macOS restriction (unlikely
+for an unsandboxed native install, but not yet ruled out), a fallback worth considering is
+shelling out to `dns-sd`/`avahi-browse` as an alternative discovery mechanism - but do not reach
+for that until discovery is actually confirmed broken *inside the real Jellyfin server process*,
+since this dev-machine console-app test may simply not be representative.
+
+### Next steps, in order
+
+1. **The test Jellyfin instance is currently running 10.11.6, not 12.0.** A 12.0-targeted plugin's
    assembly version requirements mean it will not load there at all (see the `JellyfinServerVersion`
    comment in the `.csproj` - Jellyfin plugin assemblies aren't forward/backward compatible across
    server versions). The user needs to upgrade that instance before the plugin can be loaded and
    tested end-to-end; flagged, not yet resolved as of this writing.
-4. An API key for the test instance (`http://192.168.2.14:8096`) was provided during development
+2. An API key for the test instance (`http://192.168.2.14:8096`) was provided during development
    for diagnostics. **Do not commit it to this repo** - treat it as a local secret only.
-5. Once loadable: verify discovery finds the real Chromecast on the network, verify a cast
-   actually starts the receiver and plays back, verify an H.265 source transcodes correctly,
-   verify play/pause/seek/stop/volume all round-trip correctly, verify the minted access token is
-   revoked on stop.
+3. Once on 12.0: install the plugin, confirm it loads (check the server log for the
+   `PluginServiceRegistrator`/`ChromecastHost` startup messages), and confirm discovery actually
+   finds the Chromecast from inside the real server process.
+4. Then: verify a cast actually starts the receiver and plays back, verify an H.265 source
+   transcodes correctly, verify play/pause/seek/stop/volume all round-trip correctly, verify the
+   minted access token is revoked on stop.
+5. Still worth confirming once real casting works: exact JSON field casing Jellyfin's API uses for
+   `PlaybackProgressInfo` in the connectsdk status broadcasts (assumed PascalCase, matching .NET's
+   default `System.Text.Json` behavior - not yet confirmed against a live wire capture), and that
+   `F007D354`/`6F511C87` are launchable by an arbitrary CastV2 sender (should be, per Google's
+   "Custom application" registration model having no sender allowlist, but blocked on discovery
+   working first to actually reach a device to launch on).
 
 ## Building
 
