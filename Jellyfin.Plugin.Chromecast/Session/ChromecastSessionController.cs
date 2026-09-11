@@ -275,6 +275,17 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
     private async Task SendPlayCommandCoreAsync(PlayRequest command, List<BaseItemDto> items, User? user, CancellationToken cancellationToken)
     {
+        // PlayNext/PlayLast mean "add to the queue of whatever is already casting" - they must
+        // never go through the launch-a-fresh-app path below. Sending them there anyway (the
+        // original bug: this method always launched fresh and sent "PlayNow" regardless of what
+        // PlayCommand actually asked for) restarts the receiver app mid-playback, which is what
+        // "adding to the queue crashed the whole stream" turned out to mean - confirmed by testing.
+        if (command.PlayCommand is PlayCommand.PlayNext or PlayCommand.PlayLast)
+        {
+            await SendQueueCommandAsync(command, items).ConfigureAwait(false);
+            return;
+        }
+
         var client = await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
         if (client is null || _connectSdkChannel is null)
         {
@@ -322,19 +333,58 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         client.HeartbeatChannel.AdditionalDestinationId = transportId;
         StartAppKeepAlive(client, transportId);
 
-        var options = new PlayNowOptions
+        // "Identify" is what makes the receiver show its own branded "ready"/waiting screen
+        // (DocumentManager.setAppStatus(Waiting) in the receiver's own source) - without ever
+        // sending it, a fresh launch goes straight from blank/idle to loading media with no
+        // visible "connected" moment in between. Reported by the user as a regression ("the ready
+        // to cast screen doesn't show up any more, only once playback actually starts") - what
+        // they'd seen before was actually just residual state left over from the receiver having
+        // *just* finished a previous cast during heavy back-to-back testing, not anything this
+        // plugin was deliberately doing.
+        await _connectSdkChannel.SendCommandAsync("Identify", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, null, transportId).ConfigureAwait(false);
+
+        var options = BuildPlayNowOptions(items, command.StartPositionTicks, command.MediaSourceId, command.AudioStreamIndex, command.SubtitleStreamIndex);
+        await _connectSdkChannel.SendCommandAsync("PlayNow", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, options, transportId).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Adds items to the queue of whatever is already casting ("PlayNext"/"PlayLast" from
+    /// <see cref="PlayCommand"/>) - unlike a fresh <see cref="PlayCommand.PlayNow"/>, this must
+    /// reuse the existing connection/app instance rather than relaunching, since the receiver
+    /// keeps its own internal queue that a relaunch would destroy along with whatever was
+    /// currently playing.
+    /// </summary>
+    private Task SendQueueCommandAsync(PlayRequest command, List<BaseItemDto> items)
+    {
+        if (_connectSdkChannel is null || _appTransportId is null || _mintedAccessToken is null)
+        {
+            _logger.LogWarning(
+                "Chromecast {Name} received a {Command} queue command with nothing currently casting - ignoring",
+                _receiver.Name,
+                command.PlayCommand);
+            return Task.CompletedTask;
+        }
+
+        var receiverCommand = command.PlayCommand == PlayCommand.PlayNext ? "PlayNext" : "PlayLast";
+        _logger.LogInformation("Adding {Count} item(s) to the Chromecast queue ({Command}) on {DeviceName}", items.Count, receiverCommand, _receiver.Name);
+
+        var options = BuildPlayNowOptions(items, command.StartPositionTicks, command.MediaSourceId, command.AudioStreamIndex, command.SubtitleStreamIndex);
+        return _connectSdkChannel.SendCommandAsync(receiverCommand, _session.UserId, _mintedAccessToken, _serverAddress, _receiver.Name, options, _appTransportId);
+    }
+
+    private static PlayNowOptions BuildPlayNowOptions(List<BaseItemDto> items, long? startPositionTicks, string? mediaSourceId, int? audioStreamIndex, int? subtitleStreamIndex)
+    {
+        return new PlayNowOptions
         {
             // PascalCase, matching Jellyfin's normal API casing - see the XML doc on
             // PlayNowOptions.Items for why this must not go through the envelope's camelCase
             // serializer options.
             Items = items.Select(item => JsonSerializer.SerializeToElement(item, ApiJsonOptions)).ToList(),
-            StartPositionTicks = command.StartPositionTicks,
-            MediaSourceId = command.MediaSourceId,
-            AudioStreamIndex = command.AudioStreamIndex,
-            SubtitleStreamIndex = command.SubtitleStreamIndex
+            StartPositionTicks = startPositionTicks,
+            MediaSourceId = mediaSourceId,
+            AudioStreamIndex = audioStreamIndex,
+            SubtitleStreamIndex = subtitleStreamIndex
         };
-
-        await _connectSdkChannel.SendCommandAsync("PlayNow", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, options, transportId).ConfigureAwait(false);
     }
 
     private async Task SendPlaystateCommand(PlaystateRequest? command, CancellationToken cancellationToken)
