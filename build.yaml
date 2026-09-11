@@ -17,4 +17,7 @@ category: "General"
 artifacts:
 - "Jellyfin.Plugin.Chromecast.dll"
 changelog: >
-  0.1.0.0: Initial development version.
+  0.1.0.0: First public test release. Confirmed working against real Chromecast hardware and the
+  iOS/macOS apps: discovery, casting, H.265/HEVC transcoding, play/pause/unpause/stop/seek/skip/
+  volume/mute, queueing and queue navigation, live playback state in the remote control screen,
+  picking up an in-progress cast from a second device, and access token cleanup on stop.

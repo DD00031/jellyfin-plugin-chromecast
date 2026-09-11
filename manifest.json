@@ -2,11 +2,19 @@
   {
     "guid": "06afff54-6a74-4e08-9d50-9fa63803c73d",
     "name": "Chromecast",
-    "description": "Discovers Google Cast (Chromecast) devices on the local network and exposes each one as a session in Jellyfin's existing cast/remote-control interface. Casting is handed off to Jellyfin's own cast receiver app, so it works the same way it already does for Chrome/Android users - but from every client, including iOS/iPadOS/macOS.",
+    "description": "Adds Google Cast (Chromecast) devices to Jellyfin's built-in \"Play On\" cast interface, on every client - including the iOS/iPadOS/macOS apps, which have no Google Cast SDK of their own and can't use the Chrome-only cast button that jellyfin-web ships with. Discovered Chromecast devices are registered as Jellyfin sessions, the same way the built-in DLNA \"Play To\" feature works, so they show up automatically wherever you'd cast from. Casting itself is handed off to Jellyfin's own bundled cast receiver app - the exact same one Chrome and Android users already cast to - so transcoding, subtitles, and codec negotiation (including transcoding H.265/HEVC sources that older Chromecast hardware can't decode) work the same way they already do there, instead of being reimplemented. Requires Jellyfin 12.0 or later.",
     "overview": "Cast to Google Cast devices from Jellyfin's built-in cast interface, on every client including iOS/iPadOS/macOS.",
     "owner": "DD00031",
     "category": "General",
-    "imageUrl": "https://raw.githubusercontent.com/DD00031/jellyfin-plugin-chromecast/main/.github/assets/icon.png",
-    "versions": []
+    "versions": [
+      {
+        "version": "0.1.0.0",
+        "changelog": "First public test release. Confirmed working against real Chromecast hardware and the iOS/macOS apps: discovery, casting, H.265/HEVC transcoding, play/pause/unpause/stop/seek/skip/volume/mute, queueing and queue navigation, live playback state in the remote control screen, picking up an in-progress cast from a second device, and access token cleanup on stop. Early release - please report anything that doesn't work as expected. See https://github.com/DD00031/jellyfin-plugin-chromecast/blob/main/CLAUDE.md for full technical background.",
+        "targetAbi": "12.0.0.0",
+        "sourceUrl": "https://github.com/DD00031/jellyfin-plugin-chromecast/releases/download/v0.1.0.0/Jellyfin.Plugin.Chromecast_0.1.0.0.zip",
+        "checksum": "8ade6feb009d9e67114ebd6a4b734186",
+        "timestamp": "2026-09-11T15:04:18.0000000Z"
+      }
+    ]
   }
 ]
