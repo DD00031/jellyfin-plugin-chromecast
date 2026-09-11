@@ -65,6 +65,19 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     /// </summary>
     private string? _appTransportId;
 
+    /// <summary>
+    /// Periodically re-sends CONNECT to <see cref="_appTransportId"/> while a cast is active.
+    /// CastV2 heartbeat (ping/pong) keeps the "receiver-0" platform connection alive, but the
+    /// separate virtual connection to the *app's own* transport id apparently has its own,
+    /// shorter idle timeout - observed emptying the receiver's app-transport connection well
+    /// under a minute after the initial cast, with the device then sending CLOSE (which
+    /// SharpCaster's ConnectionChannel obediently reacts to by tearing down the whole client).
+    /// Re-issuing CONNECT is a lightweight, idempotent way to signal continued interest in that
+    /// connection - actual PlaybackInfo/progress traffic to the app happens independently on the
+    /// receiver's own HTTP connection to Jellyfin, unaffected either way.
+    /// </summary>
+    private Timer? _appKeepAliveTimer;
+
     private string? _mintedAccessToken;
 
     private bool _disposed;
@@ -119,20 +132,33 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     public void MarkStale() => _stale = true;
 
     /// <inheritdoc />
-    public Task SendMessage<T>(SessionMessageType name, Guid messageId, T data, CancellationToken cancellationToken)
+    public async Task SendMessage<T>(SessionMessageType name, Guid messageId, T data, CancellationToken cancellationToken)
     {
         if (_disposed)
         {
-            return Task.CompletedTask;
+            return;
         }
 
-        return name switch
+        try
         {
-            SessionMessageType.Play => SendPlayCommand(data as PlayRequest, cancellationToken),
-            SessionMessageType.Playstate => SendPlaystateCommand(data as PlaystateRequest, cancellationToken),
-            SessionMessageType.GeneralCommand => SendGeneralCommand(data as GeneralCommand, cancellationToken),
-            _ => Task.CompletedTask
-        };
+            var task = name switch
+            {
+                SessionMessageType.Play => SendPlayCommand(data as PlayRequest, cancellationToken),
+                SessionMessageType.Playstate => SendPlaystateCommand(data as PlaystateRequest, cancellationToken),
+                SessionMessageType.GeneralCommand => SendGeneralCommand(data as GeneralCommand, cancellationToken),
+                _ => Task.CompletedTask
+            };
+            await task.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Belt-and-suspenders on top of the per-command try/catches below: Jellyfin's
+            // SessionManager does not appear to await/observe the task this method returns, so
+            // anything thrown before reaching one of those inner try blocks (e.g. while resolving
+            // items from the library, before SendPlayCommandCoreAsync is ever called) would
+            // otherwise vanish with no log at all.
+            _logger.LogError(ex, "Error handling {MessageType} command for Chromecast {Name}", name, _receiver.Name);
+        }
     }
 
     private async Task SendPlayCommand(PlayRequest? command, CancellationToken cancellationToken)
@@ -188,6 +214,42 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         _client = null;
         _connectSdkChannel = null;
         _appTransportId = null;
+        StopAppKeepAlive();
+    }
+
+    private void StopAppKeepAlive()
+    {
+        _appKeepAliveTimer?.Dispose();
+        _appKeepAliveTimer = null;
+    }
+
+    private void StartAppKeepAlive(ChromecastClient client, string transportId)
+    {
+        StopAppKeepAlive();
+        var interval = TimeSpan.FromSeconds(5);
+        _appKeepAliveTimer = new Timer(_ => AppKeepAliveTick(client, transportId), null, interval, interval);
+    }
+
+    private async void AppKeepAliveTick(ChromecastClient client, string transportId)
+    {
+        try
+        {
+            // Re-issuing CONNECT to the app's own transport alone was NOT enough to prevent the
+            // device disconnecting ~28-30s after a cast (confirmed by testing) - that's a
+            // non-standard use of the connection namespace the receiver *platform* likely doesn't
+            // treat as "sender is still here" for its own liveness accounting. A standard
+            // RECEIVER_STATUS request on "receiver-0", which is what a normal Chrome/Android
+            // sender periodically does anyway, is the traffic pattern the platform actually
+            // watches for.
+            await client.ConnectionChannel.ConnectAsync(transportId).ConfigureAwait(false);
+            await client.ReceiverChannel.GetChromecastStatusAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The connection is probably already dead at this point; the next real command will
+            // discover that (via InvalidateConnection) and reconnect. Nothing further to do here.
+            _logger.LogDebug(ex, "Chromecast {Name} app keep-alive failed", _receiver.Name);
+        }
     }
 
     private async Task SendPlayCommandCoreAsync(PlayRequest command, List<BaseItemDto> items, User? user, CancellationToken cancellationToken)
@@ -236,6 +298,8 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }
 
         _appTransportId = transportId;
+        client.HeartbeatChannel.AdditionalDestinationId = transportId;
+        StartAppKeepAlive(client, transportId);
 
         var options = new PlayNowOptions
         {
@@ -408,7 +472,12 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
                 return _client;
             }
 
-            var client = new ChromecastClient();
+            // The parameterless ChromecastClient() constructor passes a null logger through to
+            // every built-in channel (ConnectionChannel, HeartbeatChannel, ReceiverChannel, ...),
+            // silencing all of SharpCaster's own diagnostics - including exactly the heartbeat
+            // ping/pong/timeout logging needed to debug the connection-longevity issue in
+            // CLAUDE.md. Pass a real logger.
+            var client = new ChromecastClient(_loggerFactory.CreateLogger<ChromecastClient>());
 
             var connectSdkChannel = new ConnectSdkChannel(_loggerFactory.CreateLogger<ConnectSdkChannel>());
             client.AddChannel(connectSdkChannel);
@@ -466,7 +535,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }
     }
 
-    private Task HandlePlaybackStartAsync(string? data)
+    private Task HandlePlaybackStartAsync(JsonElement? data)
     {
         var info = DeserializeProgress(data);
         if (info is null)
@@ -486,7 +555,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         });
     }
 
-    private Task HandlePlaybackProgressAsync(string? data)
+    private Task HandlePlaybackProgressAsync(JsonElement? data)
     {
         var info = DeserializeProgress(data);
         if (info is null)
@@ -498,7 +567,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         return _sessionManager.OnPlaybackProgress(info);
     }
 
-    private Task HandlePlaybackStopAsync(string? data)
+    private Task HandlePlaybackStopAsync(JsonElement? data)
     {
         var info = DeserializeProgress(data);
         if (info is null)
@@ -516,20 +585,20 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         });
     }
 
-    private PlaybackProgressInfo? DeserializeProgress(string? data)
+    private PlaybackProgressInfo? DeserializeProgress(JsonElement? data)
     {
-        if (string.IsNullOrEmpty(data))
+        if (data is null || data.Value.ValueKind != JsonValueKind.Object || !data.Value.TryGetProperty("PlayState", out var playState))
         {
             return null;
         }
 
         try
         {
-            return JsonSerializer.Deserialize<PlaybackProgressInfo>(data, ApiJsonOptions);
+            return JsonSerializer.Deserialize<PlaybackProgressInfo>(playState.GetRawText(), ApiJsonOptions);
         }
         catch (JsonException ex)
         {
-            _logger.LogDebug(ex, "Could not parse playback status from Chromecast receiver: {Data}", data);
+            _logger.LogDebug(ex, "Could not parse playback status from Chromecast receiver: {Data}", playState.GetRawText());
             return null;
         }
     }
@@ -542,6 +611,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         _client = null;
         _connectSdkChannel = null;
         _appTransportId = null;
+        StopAppKeepAlive();
 
         if (client is not null)
         {
@@ -560,6 +630,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }
 
         _disposed = true;
+        StopAppKeepAlive();
 
         await RevokeAccessTokenAsync().ConfigureAwait(false);
 

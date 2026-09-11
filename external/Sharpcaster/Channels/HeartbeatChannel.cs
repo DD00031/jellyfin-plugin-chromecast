@@ -52,6 +52,16 @@ namespace Sharpcaster.Channels
 
         public event EventHandler? StatusChanged;
 
+        /// <summary>
+        /// Patch: an extra CastV2 destination id to also send heartbeat ping/pong traffic to,
+        /// alongside the default "receiver-0" platform destination. Heartbeat traffic addressed
+        /// only to "receiver-0" was not enough on its own to keep a separate virtual connection
+        /// to a *launched app's* transport id alive - confirmed by testing, a connection to the
+        /// Jellyfin Chromecast plugin's receiver app was reliably torn down ~20-30s after launch
+        /// even with heartbeat responding correctly on "receiver-0". Set this to the app's
+        /// transport id once known. See PATCH.md.
+        /// </summary>
+        public string? AdditionalDestinationId { get; set; }
 
         /// <summary>
         /// Called when a message for this channel is received
@@ -69,8 +79,13 @@ namespace Sharpcaster.Channels
                 return;
             }
             _timer.Stop();
-            var pongMessage = new PongMessage();
-            await SendAsync(JsonSerializer.Serialize(pongMessage, SharpcasteSerializationContext.Default.PongMessage)).ConfigureAwait(false);
+            var pongJson = JsonSerializer.Serialize(new PongMessage(), SharpcasteSerializationContext.Default.PongMessage);
+            await SendAsync(pongJson).ConfigureAwait(false);
+            if (AdditionalDestinationId is not null)
+            {
+                await SendAsync(pongJson, AdditionalDestinationId).ConfigureAwait(false);
+            }
+
             _timer.Start();
             if (Logger != null) LogPongSent(Logger, null);
         }
@@ -103,9 +118,20 @@ namespace Sharpcaster.Channels
                 SafeInvokeEvent(StatusChanged, this, e);
                 return;
             }
-            var pingMessage = new PingMessage();
-            await SendAsync(JsonSerializer.Serialize(pingMessage, SharpcasteSerializationContext.Default.PingMessage)).ConfigureAwait(false);
+            var pingJson = JsonSerializer.Serialize(new PingMessage(), SharpcasteSerializationContext.Default.PingMessage);
+            await SendAsync(pingJson).ConfigureAwait(false);
+            if (AdditionalDestinationId is not null)
+            {
+                await SendAsync(pingJson, AdditionalDestinationId).ConfigureAwait(false);
+            }
+
             _triedToPing = true;
+            // Patch: _timer.AutoReset is false, so without restarting it here the timer never
+            // fires again after this one unanswered ping - the "did the device actually respond"
+            // check on the next elapse (the _triedToPing branch above) would never run, silently
+            // disabling heartbeat timeout detection for the rest of the connection's life. See
+            // PATCH.md.
+            _timer.Start();
             if (Logger != null) LogPingSent(Logger, null);
         }
 

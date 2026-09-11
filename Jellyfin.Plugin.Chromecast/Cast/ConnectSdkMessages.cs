@@ -7,8 +7,11 @@ namespace Jellyfin.Plugin.Chromecast.Cast;
 /// <summary>
 /// A status message broadcast by Jellyfin's cast receiver over the connectsdk namespace. Mirrors
 /// the receiver's own <c>BusMessage</c> type (see jellyfin-chromecast's <c>types/global.d.ts</c>).
-/// <see cref="Data"/> is itself a JSON-encoded string (usually a
-/// <see cref="MediaBrowser.Model.Session.PlaybackProgressInfo"/>), not a nested object.
+/// <see cref="Data"/> is a nested JSON object (confirmed against a live wire capture - not a
+/// JSON-encoded string as its own field name might suggest), shaped like the receiver's
+/// <c>getSenderReportingData()</c> output: <c>{ ItemId, PlayState: {...}, QueueableMediaTypes,
+/// NowPlayingItem }</c>, where <c>PlayState</c> is what maps onto
+/// <see cref="MediaBrowser.Model.Session.PlaybackProgressInfo"/>'s fields - not <c>Data</c> itself.
 /// </summary>
 public sealed class ConnectSdkStatusMessage
 {
@@ -24,10 +27,11 @@ public sealed class ConnectSdkStatusMessage
     public string? Message { get; set; }
 
     /// <summary>
-    /// Gets or sets the JSON-encoded payload for the event, typically a
+    /// Gets or sets the payload for the event - a <c>{ ItemId, PlayState, ... }</c> object for
+    /// playback events. See the type-level remarks for why this isn't deserialized directly into
     /// <see cref="MediaBrowser.Model.Session.PlaybackProgressInfo"/>.
     /// </summary>
-    public string? Data { get; set; }
+    public JsonElement? Data { get; set; }
 }
 
 /// <summary>

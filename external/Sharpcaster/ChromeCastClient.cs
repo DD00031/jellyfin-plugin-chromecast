@@ -224,54 +224,74 @@ namespace Sharpcaster
                     var payload = (castMessage.PayloadType == PayloadType.Binary ?
                         Encoding.UTF8.GetString(castMessage.PayloadBinary.ToByteArray()) : castMessage.PayloadUtf8);
 
-                    var channel = Channels.FirstOrDefault(c => c.Namespace == castMessage.Namespace);
-                    if (channel != null)
+                    // Patch: everything from here to the end of the loop body used to run
+                    // unguarded - any exception (confirmed by testing: a real Chromecast sent an
+                    // unsolicited MEDIA_STATUS broadcast whose "requestId" value didn't fit in
+                    // System.Text.Json's strict System.Int32 deserialization target) escaped all
+                    // the way out to the try/catch wrapping the *entire* while(true) loop below,
+                    // which silently ends the receive loop for good - no more exceptions, no more
+                    // retries, just total, permanent silence on this connection from that point
+                    // on. Every subsequent inbound message is lost forever, including this
+                    // client's own heartbeat PONG replies, which is what actually caused the
+                    // connection-longevity issue described in CLAUDE.md: not a real heartbeat
+                    // failure, but this receive loop having already silently died and taken every
+                    // future PONG down with it. One bad message must not be allowed to do that -
+                    // catch here and move on to the next message instead. See PATCH.md.
+                    try
                     {
-                        if (channel != HeartbeatChannel)
+                        var channel = Channels.FirstOrDefault(c => c.Namespace == castMessage.Namespace);
+                        if (channel != null)
                         {
-                            HeartbeatChannel.RestartTimeoutTimer();
-                        }
-                        if (channel?.Logger != null) LogReceivedMessage(channel.Logger, payload, null);
-
-                        var message = JsonSerializer.Deserialize(payload, SharpcasteSerializationContext.Default.MessageWithId);
-                        if (message != null && MessageTypes.TryGetValue(message.Type, out Type? type))
-                        {
-                            try
+                            if (channel != HeartbeatChannel)
                             {
-                                channel?.OnMessageReceived(payload, message.Type);
-                                if (message.HasRequestId)
+                                HeartbeatChannel.RestartTimeoutTimer();
+                            }
+                            if (channel?.Logger != null) LogReceivedMessage(channel.Logger, payload, null);
+
+                            var message = JsonSerializer.Deserialize(payload, SharpcasteSerializationContext.Default.MessageWithId);
+                            if (message != null && MessageTypes.TryGetValue(message.Type, out Type? type))
+                            {
+                                try
                                 {
-                                    WaitingTasks.TryRemove(message.RequestId, out SharpCasterTaskCompletionSource? tcs);
-                                    tcs?.SetResult(payload);
-                                    if (tcs == null)
-                                        if (_logger != null) LogNoTaskCompletionSource(_logger, message.RequestId, WaitingTasks.Count, message.Type, null);
+                                    channel?.OnMessageReceived(payload, message.Type);
+                                    if (message.HasRequestId)
+                                    {
+                                        WaitingTasks.TryRemove(message.RequestId, out SharpCasterTaskCompletionSource? tcs);
+                                        tcs?.SetResult(payload);
+                                        if (tcs == null)
+                                            if (_logger != null) LogNoTaskCompletionSource(_logger, message.RequestId, WaitingTasks.Count, message.Type, null);
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    if (_logger != null) LogExceptionProcessingResponse(_logger, ex.Message, ex);
+                                    if (message.HasRequestId)
+                                    {
+                                        WaitingTasks.TryRemove(message.RequestId, out SharpCasterTaskCompletionSource? tcs);
+                                        tcs?.SetException(ex);
+                                    }
                                 }
                             }
-                            catch (Exception ex)
+                            else
                             {
-                                if (_logger != null) LogExceptionProcessingResponse(_logger, ex.Message, ex);
-                                if (message.HasRequestId)
-                                {
-                                    WaitingTasks.TryRemove(message.RequestId, out SharpCasterTaskCompletionSource? tcs);
-                                    tcs?.SetException(ex);
-                                }
+                                // Patch: upstream only dispatches to channel.OnMessageReceived when
+                                // message.Type matches one of the fixed, built-in Cast message types
+                                // (PING/PONG/RECEIVER_STATUS/...) registered in RegisterMessages -
+                                // anything else (e.g. a custom channel's own "type" values, like the
+                                // Jellyfin Chromecast plugin's connectsdk "playbackstart"/"error"/...
+                                // broadcasts) was silently dropped before ever reaching the channel,
+                                // with no error and no indication anything was lost. See PATCH.md.
+                                channel?.OnMessageReceived(payload, message?.Type ?? string.Empty);
                             }
                         }
                         else
                         {
-                            if (_logger != null)
-                            {
-                                if (message?.Type == null)
-                                    LogMessageConversionError(_logger, "null", null);
-                                else
-                                    LogMessageConversionError(_logger, message.Type, null);
-                            }
-                            Debugger.Break();
+                            if (_logger != null) LogChannelParseError(_logger, castMessage.Namespace, payload, null);
                         }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        if (_logger != null) LogChannelParseError(_logger, castMessage.Namespace, payload, null);
+                        if (_logger != null) LogExceptionProcessingResponse(_logger, ex.Message, ex);
                     }
                 }
             }
