@@ -369,16 +369,71 @@ An API key for the local test instance (`http://192.168.2.14:8096`) was used dur
 for diagnostics and for driving test casts via the REST API directly. It is not stored in this
 repo and must never be committed - treat any such key as a local secret only.
 
-### Remaining before this is a real release
+### RESOLVED: status broadcasts silently failed to parse (dashless Guid format)
 
-Confirmed working (see above): discovery, cast, H.265 transcode, play/pause/unpause/stop, live
-`PlayState` visibility, access token revocation on stop, and - per the user - casting from the
-actual iOS and macOS Jellyfin apps' own cast UI (not just direct REST API calls), to the same
-extent as everything tested here directly.
+Found via real-world testing from the actual iOS app (not just direct REST API calls): the user
+reported (a) the "Play On" remote-control screen showed playback controls that worked (play,
+pause, volume) but no title/artwork for what was casting, and (b) seeking always reset to 0:00
+instead of landing on the target position, and the skip buttons did nothing.
 
-Still open:
-- Test seek and volume/mute specifically (not yet exercised - only Play/Pause/Unpause/Stop have
-  been).
+Root cause for (a): **every single incoming connectsdk status broadcast was silently failing to
+deserialize**, logged only at Debug level ("Could not parse playback status") so invisible by
+default. `System.Text.Json`'s built-in `Guid` converter only accepts the canonical dashed format -
+the receiver's own reporting writes item ids in Jellyfin's dashless "N" format (e.g.
+`"b565cf7176b943ceb165fece9b26181f"`), which it rejects outright, unlike the more permissive
+`Guid.Parse(string)`. Added `FlexibleGuidConverter` (delegates to `Guid.Parse`) and
+`JsonStringEnumConverter` (needed for `"PlayMethod":"Transcode"`-style string enums, the next
+thing that would have failed) to `ApiJsonOptions`. This session's own `OnPlaybackStart`/`Progress`
+had never successfully fired even once before this fix - `NowPlayingItem`/`PlayState` stayed
+empty on *this* session the entire time, even though the receiver's own separate,
+directly-authenticated session (see "two sessions per cast" below) kept reporting real state
+correctly under its own identity throughout. Confirmed fixed: casting now populates
+`NowPlayingItem`/`PlayState` on this plugin's own session correctly.
+
+(b) turned out to be the *same* bug, not a separate one: `SendPlaystateCommand`'s `Seek` case
+was always correctly implemented, but the whole session's state was invisible/untrusted before
+this fix, and earlier ad-hoc curl testing had also been unknowingly hitting a second, dead/stale
+session for the same device (see below) rather than a real seek failure. Confirmed fixed against
+real hardware post-fix: seeking a ~592s video to 3:00 landed correctly at 3:00, not 0:00. The skip
+forward/back buttons route through the same `Seek` command, so should be fixed too, though not yet
+explicitly re-tested with real button presses (only via direct `SeekPositionTicks` API calls).
+
+### Two Jellyfin sessions exist per cast - investigate if this causes user-visible confusion
+
+Every cast currently creates **two** separate Jellyfin sessions for the same physical device:
+1. This plugin's own synthetic `SessionInfo` (`DeviceId: chromecast-<hash>`,
+   `SupportsMediaControl: true`) - what shows up in the "Play On" cast menu and receives
+   Play/Playstate commands.
+2. The receiver's **own** session, created automatically the moment it authenticates with the
+   token this plugin mints for it (`DeviceId: base64(receiverName)` - confirmed:
+   `JellyfinApi.setServerInfo` in jellyfin-chromecast's own source sets
+   `this.deviceId = btoa(receiverName)` when a `receiverName` is provided, which this plugin
+   always does). This session is not attached to any `ISessionController` and doesn't support
+   media control (`SupportsMediaControl: false`) - it exists purely because the receiver is a
+   real, independently-authenticated Jellyfin client making its own API calls (which is
+   deliberate - see "The actual design" above for why).
+
+This is architecturally inherent, not obviously a bug to fix outright - Chrome's own official
+casting flow has exactly the same duality (the receiver has always created its own session there
+too), it's just invisible normally because Chrome's cast icon never relied on Jellyfin's own
+session list at all. The user reported not being able to "pick up" an in-progress cast (started
+from their phone) when later opening the Jellyfin app on their Mac and selecting the same
+Chromecast - **this may already be substantially improved by the parsing fix above**, since before
+it, session #1 (the one any client actually looks at/controls) had no live state to show at all,
+which would look exactly like "nothing is playing here" to a client trying to join. Not yet
+re-tested specifically after the fix - worth confirming whether it's fully resolved or still needs
+attention (e.g. deciding whether these two sessions should somehow be merged/deduplicated in the
+UI, which would need investigating what jellyfin-web/the mobile apps actually key off when
+deciding "this device already has an active session, show remote controls instead of a fresh
+cast").
+
+### Still open
+
+- Re-test the "pick up an existing cast from a second client" scenario now that session #1's
+  state is no longer empty (see above).
+- Explicitly re-test the skip forward/back buttons via real button presses (not just direct
+  `SeekPositionTicks` API calls) and volume/mute (user reports these already work well, but not
+  re-verified after this round of fixes - should be unaffected either way).
 - Test multi-item queue playback (`NextTrack`/`PreviousTrack`) - the receiver keeps its own queue
   from the full `items` list passed in `PlayNow`, but this hasn't been exercised with more than
   one item.
@@ -392,6 +447,9 @@ Still open:
   to eventually drop the vendoring.
 - Write real user-facing installation instructions (README currently just points here) once ready
   to cut an actual release/manifest entry.
+- The Jellyfin dashboard's own "Stop" button was reported not working during testing - the user
+  confirmed this is a pre-existing Jellyfin UI issue unrelated to this plugin (Stop via the
+  `/Sessions/{id}/Playing/Stop` API works correctly, confirmed repeatedly).
 
 ## Building
 
