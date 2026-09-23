@@ -4,7 +4,7 @@ Adds Google Cast (Chromecast) devices to Jellyfin's built-in "Play On" / cast in
 **every** Jellyfin client, including the iOS/iPadOS/macOS apps, which have no Google Cast SDK of
 their own and can't use the Chrome-only cast button that jellyfin-web ships with.
 
-> **Status: early public test release (0.1.1.0).** Confirmed working end-to-end against real
+> **Status: early public test release (0.1.2.0).** Confirmed working end-to-end against real
 > Chromecast hardware and the real iOS/macOS Jellyfin apps: discovery, casting, transcoding
 > H.265/HEVC sources to H.264, play/pause/unpause/stop/seek/skip/volume/mute, queueing and queue
 > navigation, and live playback state in the remote control screen. Please report anything that

@@ -523,6 +523,45 @@ the matching receiver command via the existing `SendReceiverCommandAsync` helper
 that payload shape. Not yet confirmed against real hardware - next step is to have the user retry
 switching subtitle tracks mid-cast on 0.1.0.0 + this fix.
 
+### RESOLVED: 0.1.1.0 update stuck at "0.1.0.0 active", uninstall/disable throwing an error
+
+Reported after the user tried to update from 0.1.0.0 to 0.1.1.0 on their main server: after
+installing the update and restarting, the dashboard still showed 0.1.0.0 as active, and both
+"Disable" and "Uninstall" failed with a bare "An error occurred while ..." with no further detail.
+
+Root cause: **`Directory.Build.props`** (repo root, applies to every project in the solution,
+including the vendored Sharpcaster) hardcodes `<Version>`/`<AssemblyVersion>`/`<FileVersion>` to
+`0.1.0.0` - and publishing 0.1.1.0 only updated `manifest.json`/`build.yaml`/`README.md`, not this
+file. Jellyfin's plugin manager identifies/tracks installed plugin versions by each plugin
+assembly's own real `AssemblyVersion` (`BasePlugin.Version` reads `Assembly.GetName().Version`),
+**not** by the version string in `manifest.json` or the release zip's filename - those only drive
+what the *installer* downloads and which folder it extracts into
+(`plugins/Chromecast_<manifest-version>/`). Since the 0.1.1.0 zip's DLL was - despite its filename
+- still internally versioned 0.1.0.0 (confirmed by testing:
+`dotnet build -getProperty:AssemblyVersion` on the 0.1.1.0 build genuinely printed `0.1.0.0`), the
+install left two on-disk plugin folders (`Chromecast_0.1.0.0` and `Chromecast_0.1.1.0`) whose
+assemblies both self-report as the *same* version, under the *same* plugin GUID. Jellyfin's plugin
+manager cannot cleanly resolve "which installed copy is current" from that state, which matches
+every symptom reported: the dashboard keeps showing the old version as active (it's reading the
+assembly's real version, which never changed), and Disable/Uninstall throw instead of completing
+because the operation can't unambiguously target one of the two conflicting copies.
+
+This is a real, confirmed release-process bug, not something the user did wrong. Manual recovery
+(communicated to the user directly, since it needs filesystem access to their server which isn't
+available from here): stop the actual Jellyfin process (not just an in-app restart), delete every
+`plugins/Chromecast_*` folder from its data directory, restart, then reinstall fresh from the
+repository.
+
+Fixed for future releases: bumped `Directory.Build.props` to `0.1.2.0` alongside this release, and
+confirmed via `dotnet build -getProperty:Version -getProperty:AssemblyVersion -getProperty:FileVersion`
+that it now actually flows into the build output. **`Directory.Build.props` is the single source of
+truth for the assembly's real version and MUST be bumped on every release, in lockstep with
+`manifest.json`/`build.yaml`/`README.md`'s version strings** - this file is easy to miss (it's not
+next to the other release-metadata files, and nothing enforces the two staying in sync) and missing
+it silently reproduces this exact bug. Worth revisiting: a small check/script that fails a release
+if `Directory.Build.props`'s `<Version>` doesn't match `manifest.json`'s newest entry, since this
+already slipped through once.
+
 ### Still open
 
 - Decide whether the `HeartbeatChannel.AdditionalDestinationId` patch and the plugin's own 5s
