@@ -485,6 +485,44 @@ removing that revocation call - token revocation now only happens on an explicit
 command, a CastV2 disconnect, or this controller being disposed. Confirmed fixed: `NextTrack` now
 correctly advances to and plays the queued item.
 
+### RESOLVED (pending live re-test): subtitles never worked after the very first cast
+
+Reported after real-world testing on the user's **main** server post-0.1.0.0: subtitles worked
+exactly once and never again, across many format/codec/container combinations. An attached ffmpeg
+transcode log was the first clue but turned out to be a red herring in itself - `-map -0:s` (no
+subtitle stream mapped into the HLS output) and `subtitle:0KiB` in the muxer summary are **correct,
+expected** behavior for this item's subtitle: an external `.srt` (`IsTextSubtitleStream: true`,
+`IsExternal: true`). Jellyfin never burns text subtitles into the transcoded video - it converts
+them to WebVTT on demand and the *client* (here, the receiver) side-loads them separately. So the
+right place to look was never ffmpeg; it was whether the receiver ever requests/attaches that VTT
+sidecar at all.
+
+Cloned `jellyfin/jellyfin-chromecast` fresh to read the actual current receiver source (not just
+rely on the summary in "The actual design" above) and traced the full subtitle path:
+`PlayRequest.subtitleStreamIndex` → receiver's `getPlaybackInfo(..., subtitleStreamIndex, ...)` →
+server's `PlaybackInfo` response negotiates that specific stream's `DeliveryMethod`/`DeliveryUrl` →
+`createStreamInfo` (`helpers.ts`) builds a CAF `Track` from it → attached as a text track on load.
+That confirmed the *initial* PlayNow subtitle selection genuinely depends on whatever
+`SubtitleStreamIndex` the casting client happens to put in its original `PlayRequest` (client
+behavior this plugin has no control over, same as DLNA PlayTo) - but also surfaced a real,
+plugin-side bug for *changing* the subtitle (or audio) track after a cast has already started,
+which is presumably what "tried lots of different formats/combinations" actually was in practice
+(switching tracks from the remote-control UI, not re-encoding the file):
+
+`ChromecastSessionController.SendGeneralCommand` never had a case for
+`GeneralCommandType.SetSubtitleStreamIndex`/`SetAudioStreamIndex` - both fell through to the
+`default: return Task.CompletedTask` branch and were silently dropped. Every Jellyfin sender
+(confirmed against jellyfin-web's `sessionPlayer/plugin.js`) sends these as a `GeneralCommand` with
+`Arguments["Index"]`, exactly like the already-handled `SetVolume`/`Arguments["Volume"]` - and the
+receiver's own `CommandHandler` does support `SetAudioStreamIndex`/`SetSubtitleStreamIndex`
+(`commandHandler.ts`), but expects the options payload shaped as `{ index: <int> }` (its
+`SetIndexRequest` type) - lowercase, and *not* the PascalCase-that-gets-camelCased convention the
+rest of this protocol uses for `PlayNowOptions`. Fixed: `SendGeneralCommand` now forwards both as
+the matching receiver command via the existing `SendReceiverCommandAsync` helper, with a new
+`SetIndexOptions` DTO (`Cast/ConnectSdkMessages.cs`, explicit `[JsonPropertyName("index")]`) for
+that payload shape. Not yet confirmed against real hardware - next step is to have the user retry
+switching subtitle tracks mid-cast on 0.1.0.0 + this fix.
+
 ### Still open
 
 - Decide whether the `HeartbeatChannel.AdditionalDestinationId` patch and the plugin's own 5s

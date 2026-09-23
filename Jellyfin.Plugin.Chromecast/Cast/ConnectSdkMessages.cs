@@ -86,3 +86,18 @@ public sealed class SeekOptions
     /// </summary>
     public double Position { get; set; }
 }
+
+/// <summary>
+/// The options payload for the "SetAudioStreamIndex"/"SetSubtitleStreamIndex" receiver commands.
+/// Matches the receiver's <c>SetIndexRequest</c> interface (<c>types/global.d.ts</c>) - unlike
+/// most other options payloads in this file, that interface uses a single lowercase <c>index</c>
+/// field, not one that merely happens to camelCase the same way PascalCase would.
+/// </summary>
+public sealed class SetIndexOptions
+{
+    /// <summary>
+    /// Gets or sets the stream index to select, or -1 to disable (subtitles only).
+    /// </summary>
+    [JsonPropertyName("index")]
+    public int Index { get; set; }
+}

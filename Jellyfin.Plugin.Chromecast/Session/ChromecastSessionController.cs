@@ -444,11 +444,35 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
     private Task SendGeneralCommand(GeneralCommand? command, CancellationToken cancellationToken)
     {
+        if (command is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        // Every Jellyfin sender (jellyfin-web's remote control, the mobile/TV apps' subtitle and
+        // audio track pickers) sends these as a GeneralCommand with Arguments["Index"], mirroring
+        // sessionPlayer.js's setSubtitleStreamIndex/setAudioStreamIndex. The receiver's own
+        // CommandHandler supports both ("SetAudioStreamIndex"/"SetSubtitleStreamIndex" in
+        // commandHandler.ts), expecting an options payload shaped like { index: <int> } (see
+        // SetIndexRequest in the receiver's types/global.d.ts - lowercase "index", NOT the same
+        // PascalCase-then-camelCased shape PlayNowOptions uses) - without this, switching
+        // subtitles/audio tracks after a cast has already started was a silent no-op.
+        if (command.Name is GeneralCommandType.SetSubtitleStreamIndex or GeneralCommandType.SetAudioStreamIndex)
+        {
+            if (command.Arguments.TryGetValue("Index", out var indexStr) && int.TryParse(indexStr, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var index))
+            {
+                var receiverCommand = command.Name == GeneralCommandType.SetSubtitleStreamIndex ? "SetSubtitleStreamIndex" : "SetAudioStreamIndex";
+                return SendReceiverCommandAsync(receiverCommand, new SetIndexOptions { Index = index });
+            }
+
+            return Task.CompletedTask;
+        }
+
         // Volume/mute are explicitly *not* implemented by the receiver's own command handler
         // ("implemented on the sender" per its own source) - Chrome's sender handles these via
         // the standard CastV2 receiver channel instead of the connectsdk namespace, so this
         // mirrors that rather than sending a receiver command that would be a no-op.
-        if (command is null || _client is null)
+        if (_client is null)
         {
             return Task.CompletedTask;
         }
