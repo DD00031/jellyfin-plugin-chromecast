@@ -8,6 +8,14 @@
     "category": "General",
     "versions": [
       {
+        "version": "0.1.1.0",
+        "changelog": "Fixes switching subtitle or audio tracks mid-cast from the remote-control UI, which was previously a silent no-op (the receiver command was never sent). No changes to initial-cast subtitle behavior, which still depends on the casting client's own subtitle selection at the time it starts the cast.",
+        "targetAbi": "12.0.0.0",
+        "sourceUrl": "https://github.com/DD00031/jellyfin-plugin-chromecast/releases/download/v0.1.1.0/Jellyfin.Plugin.Chromecast_0.1.1.0.zip",
+        "checksum": "0bc8b09ed964da8f9eb5d4f63b7f200a",
+        "timestamp": "2026-09-23T20:36:41.0000000Z"
+      },
+      {
         "version": "0.1.0.0",
         "changelog": "First public test release. Confirmed working against real Chromecast hardware and the iOS/macOS apps: discovery, casting, H.265/HEVC transcoding, play/pause/unpause/stop/seek/skip/volume/mute, queueing and queue navigation, live playback state in the remote control screen, picking up an in-progress cast from a second device, and access token cleanup on stop. Early release - please report anything that doesn't work as expected. See https://github.com/DD00031/jellyfin-plugin-chromecast/blob/main/CLAUDE.md for full technical background.",
         "targetAbi": "12.0.0.0",
