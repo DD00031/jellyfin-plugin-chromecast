@@ -15,7 +15,7 @@ public class PluginConfiguration : BasePluginConfiguration
         DiscoveryIntervalSeconds = 30;
         DeviceStaleAfterSeconds = 120;
         DeviceNamePrefix = string.Empty;
-        UseUnstableReceiver = false;
+        UseUnstableReceiver = true;
         AccessTokenLifetimeMinutes = 180;
         EnableDebugLogging = false;
     }
@@ -39,9 +39,10 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>
     /// Gets or sets a value indicating whether to launch the "unstable" build of Jellyfin's cast
-    /// receiver (app ID 6F511C87) instead of the default "stable" build (F007D354). Useful for
-    /// testing receiver-side fixes; matches the same choice available to Chrome users under
-    /// Settings &gt; Playback &gt; Google Cast version.
+    /// receiver (app ID 6F511C87) instead of the "stable" build (F007D354). Defaults to true because
+    /// the stable build can't load external subtitle files until upstream tags a release with
+    /// jellyfin-chromecast 6be49ae (see CLAUDE.md). Matches the same choice available to Chrome
+    /// users under Settings &gt; Playback &gt; Google Cast version.
     /// </summary>
     public bool UseUnstableReceiver { get; set; }
 

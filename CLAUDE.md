@@ -678,8 +678,10 @@ relaunching removes the same-app variant of it, but it is not confirmed as the c
 ### Still open
 
 - **Stable receiver can't load external subtitle files** until upstream tags a release containing
-  jellyfin-chromecast `6be49ae` - see the subtitles section. Until then `UseUnstableReceiver` is
-  needed for external `.srt`/`.ass` files.
+  jellyfin-chromecast `6be49ae` - see the subtitles section. `UseUnstableReceiver` therefore
+  defaults to **true** since 0.1.3.0 (a saved `false` from an older install is kept, since
+  `XmlSerializer` can't tell it from a deliberate choice). Once upstream tags that fix, consider
+  switching the default back to stable.
 - **Discovery intermittently misses a device.** Eettafel TV repeatedly went unseen by the plugin's
   Zeroconf scans for 2-3 minutes at a time (long enough to be marked inactive at 120 s) while
   macOS's `dns-sd -B _googlecast._tcp` still listed it and its cast port answered. Worth looking at

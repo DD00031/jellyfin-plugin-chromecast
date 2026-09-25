@@ -4,11 +4,16 @@ Adds Google Cast (Chromecast) devices to Jellyfin's built-in "Play On" / cast in
 **every** Jellyfin client, including the iOS/iPadOS/macOS apps, which have no Google Cast SDK of
 their own and can't use the Chrome-only cast button that jellyfin-web ships with.
 
-> **Status: early public test release (0.1.2.0).** Confirmed working end-to-end against real
+> **Status: early public test release (0.1.3.0).** Confirmed working end-to-end against real
 > Chromecast hardware and the real iOS/macOS Jellyfin apps: discovery, casting, transcoding
 > H.265/HEVC sources to H.264, play/pause/unpause/stop/seek/skip/volume/mute, queueing and queue
-> navigation, and live playback state in the remote control screen. Please report anything that
-> doesn't work as expected. See [CLAUDE.md](CLAUDE.md) for full technical background.
+> navigation, subtitles (including external `.srt` files), and live playback state in the remote
+> control screen. Please report anything that doesn't work as expected. See [CLAUDE.md](CLAUDE.md)
+> for full technical background.
+
+**Tip:** with display mirroring on (the default in the cast menu), opening a movie's page while
+connected starts the receiver on the TV right away, so playback begins about a second after you
+press Play.
 
 ## How it works
 
@@ -49,7 +54,7 @@ Dashboard → Plugins → Chromecast:
 | Discovery interval | How often to scan the network for Chromecast devices. |
 | Device timeout | How long a device may go unseen before it's removed from the cast menu. |
 | Device name prefix | Optional text prepended to each device's name in the cast menu. |
-| Use the unstable receiver build | Matches the "Google Cast version" option Chrome/web users have. |
+| Use the unstable receiver build | On by default: the stable receiver can't load external subtitle files yet. Matches the "Google Cast version" option Chrome/web users have. |
 | Access token safety-net lifetime | Fallback expiry for the token minted per cast session. |
 | Verbose logging | Logs CastV2 protocol detail to the server log for troubleshooting. |
 
