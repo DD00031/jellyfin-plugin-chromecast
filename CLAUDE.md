@@ -675,6 +675,38 @@ closed our connection mid-request (`Client disconnected before receiving respons
 plausible cause of the user's "stream breaks under rapid switching" report; joining instead of
 relaunching removes the same-app variant of it, but it is not confirmed as the cause.
 
+### Investigated, fixed by server config (not this plugin): subtitles drift after seeking
+
+Reported: subtitles are in sync when playback just runs, but lag after seeking. Reproduced
+without a Chromecast by replaying the receiver's HLS requests (master/main playlist, then a segment
+~5 minutes in, which is what a seek fetches) against a purpose-made fixture: 12 minutes of video
+with the running time burned in, keyframes every ~10.4 s, AC3 5.1 audio (forces a remux: video
+copied, audio transcoded - the same path as the user's ffmpeg log) and an `.srt` with a timestamp
+cue every 2 s ("Chromecast Seek Test (2026)" MKV and "... MP4 (2026)" in the test library).
+
+- **MKV**: Jellyfin reads keyframes from the Matroska cues on demand, the playlist follows them,
+  and after the seek the segment's video starts exactly at its playlist position (302.083 s).
+- **MP4 (like the user's movie)**: no keyframe data, so Jellyfin uses a fixed 6 s grid; with the
+  video stream-copied, ffmpeg can only cut at keyframes, so after the seek "segment 50 @ 300.0 s"
+  actually started its video at **291.7 s** (audio 300.5 s). Picture/sound drift from the timeline
+  the player (and therefore the subtitles) follows, by up to a keyframe interval.
+
+Mechanism (server v12.0 source): `DynamicHlsPlaylistGenerator` only uses keyframe data when the
+file's extension is in `EncodingOptions.AllowOnDemandMetadataBasedKeyframeExtractionForExtensions`
+(default `["mkv"]`, not exposed in the dashboard UI - `config/encoding.xml` only), and on demand it
+only runs *metadata-based* extractors (Matroska). Its `CacheDecorator` does read stored keyframe
+data first, which the **"Keyframe Extractor" scheduled task** (ffprobe-based, covers MP4) writes -
+but that task has no default trigger. Fix, verified on the test server: add `mp4` (and `m4v`,
+`mov`) to that list, run the Keyframe Extractor task, then the MP4 playlist follows the real
+keyframes and the post-seek segment starts exactly at its playlist position. Give the task a
+schedule so newly added media gets keyframe data too. Not yet confirmed visually on the TV.
+
+Side finding: the **stable** receiver's device profile lists H.264 as five separate `CodecProfile`
+entries each requiring one `VideoProfile` ("high 10", "high", "main", ...). Jellyfin applies every
+matching codec profile, so every H.264 file fails with `VideoProfileNotSupported` and is fully
+transcoded. The unstable receiver direct-streams H.264 (seen with Caminandes) - another reason for
+the unstable default.
+
 ### Still open
 
 - **Stable receiver can't load external subtitle files** until upstream tags a release containing
@@ -715,7 +747,22 @@ dotnet build -p:JellyfinServerVersion=12.0.1 Jellyfin.Plugin.Chromecast/Jellyfin
 
 Plugin assemblies are **not** forward/backward compatible across Jellyfin server patch versions -
 a build against 12.0.0 will fail to load with a bare assembly-load error against 12.0.1 and vice
-versa. Always match the exact running server version.
+versa. Always match the exact running server version. (Only 12.0.0 and 12.1.0 exist on NuGet as of
+2026-09-25 - there was no 12.0.1 package.)
+
+## Releasing
+
+Use the **Release** GitHub Actions workflow (`.github/workflows/release.yml`, manual trigger:
+Actions → Release → Run workflow). Inputs: the exact Jellyfin server version to build against,
+optionally the plugin version (default: bump the last number) and changelog, and a dry-run switch.
+`.github/scripts/release.py` updates every file that carries the version - `Directory.Build.props`
+(the DLL's real version; see the 0.1.1.0 incident), the `.csproj`'s default
+`JellyfinServerVersion`, `build.yaml`, `README.md` - then the workflow builds, **fails if the built
+DLL's `AssemblyVersion` doesn't match**, zips every DLL in the build output, adds the manifest
+entry (targetAbi = `<jellyfin version>.0`, MD5 checksum), commits as github-actions[bot], tags
+`v<version>` and creates the GitHub release. Verified with a dry run on 2026-09-25 (same 5 DLLs as
+the hand-made releases). For a release with code changes, commit the code first, then run the
+workflow with a real changelog.
 
 ## Git / GitHub
 
