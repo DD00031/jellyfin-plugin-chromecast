@@ -485,7 +485,11 @@ removing that revocation call - token revocation now only happens on an explicit
 command, a CastV2 disconnect, or this controller being disposed. Confirmed fixed: `NextTrack` now
 correctly advances to and plays the queued item.
 
-### RESOLVED (pending live re-test): subtitles never worked after the very first cast
+### RESOLVED: subtitles never worked after the very first cast
+
+**Confirmed working on real hardware** (Eettafel TV, test instance, user watched the subtitle text
+on screen) after fixing *three* independent problems - the first attempt below (forwarding
+`SetSubtitleStreamIndex`) was real but not sufficient; see "What actually fixed it" at the end.
 
 Reported after real-world testing on the user's **main** server post-0.1.0.0: subtitles worked
 exactly once and never again, across many format/codec/container combinations. An attached ffmpeg
@@ -520,8 +524,53 @@ receiver's own `CommandHandler` does support `SetAudioStreamIndex`/`SetSubtitleS
 rest of this protocol uses for `PlayNowOptions`. Fixed: `SendGeneralCommand` now forwards both as
 the matching receiver command via the existing `SendReceiverCommandAsync` helper, with a new
 `SetIndexOptions` DTO (`Cast/ConnectSdkMessages.cs`, explicit `[JsonPropertyName("index")]`) for
-that payload shape. Not yet confirmed against real hardware - next step is to have the user retry
-switching subtitle tracks mid-cast on 0.1.0.0 + this fix.
+that payload shape. (Later confirmed live: `{"index":-1}` / `{"index":0}` flip the receiver's
+reported `SubtitleStreamIndex` within a second.)
+
+**What actually fixed it** - found by live testing with HTTP request logging turned on
+(temporary `config/logging.json` overriding `Microsoft.AspNetCore.Hosting.Diagnostics` to
+`Information` logs every request with its status, which is how "did the Chromecast ever fetch the
+`.vtt`?" became answerable) and by replaying the receiver's own `PlaybackInfo` call with the device
+profile it reported (visible under the receiver's own session's `Capabilities.DeviceProfile` in
+`/Sessions`):
+
+1. **The session never advertised track-selection support.** `ChromecastDiscoveryManager`
+   reported only volume/mute `SupportedCommands`. jellyfin-web's item details page
+   (`apps/legacy/controllers/itemDetails/index.js` `renderTrackSelections`) hides the entire
+   version/audio/subtitle block unless the active player's supported commands include
+   `PlayMediaSource` - and for a remote session that list is literally the session's
+   `Capabilities.SupportedCommands`. This is the "subtitle selector disappears when I connect to
+   the Chromecast" symptom. Now also advertises `PlayMediaSource`, `SetAudioStreamIndex`,
+   `SetSubtitleStreamIndex`.
+2. **Jellyfin ignores a requested subtitle/audio index unless the media source is named too.**
+   `MediaInfoHelper.SetDeviceSpecificData` (server v12.0) only copies `AudioStreamIndex`/
+   `SubtitleStreamIndex` into the stream-builder options inside
+   `if (string.Equals(mediaSourceId, mediaSource.Id, ...))`. Without a `MediaSourceId`, the
+   requested index is silently dropped and the server uses the item's default/remembered selection
+   - and with "Remember subtitle selections" on (the default), a cast that ended with subtitles
+   reported off stores "off" for that item. That is the "worked exactly once, never again"
+   mechanism: every later PlaybackInfo came back with `DefaultSubtitleStreamIndex: -1`, which the
+   receiver treats as off, so it never even fetched the WebVTT file. It also produced the
+   confusing `SubtitleMethod=Encode` with no `SubtitleStreamIndex` in the transcode URL (hence the
+   `-map -0:s` in the user's ffmpeg log). Clients commonly send the indices without a media source
+   id, so `BuildPlayNowOptions` now fills in the first item's first media source id
+   (`ResolveMediaSourceId`) whenever an audio or subtitle index was requested - only then, so the
+   server's own choice between multiple versions isn't overridden otherwise.
+3. **The stable receiver (v1.3.1) can't load external subtitle files.** For `IsExternal`
+   subtitles its `createStreamInfo` used the server's *relative* `DeliveryUrl`
+   (`/Videos/.../Stream.vtt`) as the track URL without prefixing the server address, so the
+   Chromecast resolved it against the receiver app's own host and never reached Jellyfin
+   (confirmed: subtitle 0 selected, zero `.vtt` requests on the server). Fixed upstream in
+   jellyfin-chromecast `6be49ae` (2026-09-22, "Correctly resolve subtitle URLs against server"),
+   which is only on `master` → deployed as the **unstable** receiver (`6F511C87`); stable is built
+   from tags. With `UseUnstableReceiver` on, the Chromecast fetched `Stream.vtt` (200, `text/vtt`)
+   and the user saw the text on screen. Embedded (in-container) subtitles don't hit this bug.
+   Revisit once upstream tags a release containing `6be49ae` - then stable is fine again.
+
+Side notes from the same session: Jellyfin 12.0 rejects `?api_key=` query auth for API calls (use
+the `Authorization: MediaBrowser Token="..."` header when testing with curl); and test-instance
+discovery silently found 0 devices while a VPN tunnel (`utun`) was up - turning the VPN off fixed
+it immediately.
 
 ### RESOLVED: 0.1.1.0 update stuck at "0.1.0.0 active", uninstall/disable throwing an error
 

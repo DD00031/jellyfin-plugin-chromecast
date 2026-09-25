@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -381,10 +382,27 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             // serializer options.
             Items = items.Select(item => JsonSerializer.SerializeToElement(item, ApiJsonOptions)).ToList(),
             StartPositionTicks = startPositionTicks,
-            MediaSourceId = mediaSourceId,
+            MediaSourceId = ResolveMediaSourceId(items[0], mediaSourceId, audioStreamIndex, subtitleStreamIndex),
             AudioStreamIndex = audioStreamIndex,
             SubtitleStreamIndex = subtitleStreamIndex
         };
+    }
+
+    /// <summary>
+    /// Jellyfin's PlaybackInfo only honors a requested audio/subtitle stream index when the same
+    /// request also names the media source (MediaInfoHelper.SetDeviceSpecificData); otherwise it
+    /// silently falls back to the item's default or remembered selection. Clients casting from the
+    /// item page often send the indices without a media source id, so fill in the item's first
+    /// source whenever an index was actually requested.
+    /// </summary>
+    private static string? ResolveMediaSourceId(BaseItemDto item, string? mediaSourceId, int? audioStreamIndex, int? subtitleStreamIndex)
+    {
+        if (!string.IsNullOrEmpty(mediaSourceId) || (audioStreamIndex is null && subtitleStreamIndex is null))
+        {
+            return mediaSourceId;
+        }
+
+        return item.MediaSources?.FirstOrDefault()?.Id ?? item.Id.ToString("N", CultureInfo.InvariantCulture);
     }
 
     private async Task SendPlaystateCommand(PlaystateRequest? command, CancellationToken cancellationToken)

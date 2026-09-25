@@ -184,8 +184,15 @@ public sealed class ChromecastDiscoveryManager : IDisposable
         _sessionManager.ReportCapabilities(sessionInfo.Id, sessionInfo.Id, new ClientCapabilities
         {
             PlayableMediaTypes = new[] { MediaType.Video, MediaType.Audio },
+            // Clients only show track pickers for commands listed here: jellyfin-web's item
+            // details page hides its whole version/audio/subtitle block unless the active
+            // player advertises PlayMediaSource, and its remote-control UI checks
+            // SetAudioStreamIndex/SetSubtitleStreamIndex before offering track switching.
             SupportedCommands = new[]
             {
+                GeneralCommandType.PlayMediaSource,
+                GeneralCommandType.SetAudioStreamIndex,
+                GeneralCommandType.SetSubtitleStreamIndex,
                 GeneralCommandType.VolumeUp,
                 GeneralCommandType.VolumeDown,
                 GeneralCommandType.Mute,
