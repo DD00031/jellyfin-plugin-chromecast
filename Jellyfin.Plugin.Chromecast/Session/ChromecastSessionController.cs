@@ -101,6 +101,21 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     private Timer? _appKeepAliveTimer;
 
     private string? _mintedAccessToken;
+    private Guid _mintedTokenUserId;
+
+    /// <summary>Bumped by every cast and Stop, so a delayed receiver close can tell it's been superseded.</summary>
+    private int _castGeneration;
+
+    private static readonly TimeSpan IdleCloseAfter = TimeSpan.FromMinutes(3);
+
+    private long _lastActivityTicks = DateTime.UtcNow.Ticks;
+
+    /// <summary>
+    /// Whether the receiver has an item loaded (playing or paused). Only cleared on positive
+    /// evidence from the receiver's own broadcasts, so an unexpected broadcast shape can never
+    /// get a playing movie closed as "idle".
+    /// </summary>
+    private volatile bool _receiverHasItem = true;
 
     private bool _disposed;
     private volatile bool _stale;
@@ -160,6 +175,8 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         {
             return;
         }
+
+        MarkActivity();
 
         try
         {
@@ -239,6 +256,8 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         StopAppKeepAlive();
     }
 
+    private void MarkActivity() => Interlocked.Exchange(ref _lastActivityTicks, DateTime.UtcNow.Ticks);
+
     private void StopAppKeepAlive()
     {
         _appKeepAliveTimer?.Dispose();
@@ -265,6 +284,16 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             // watches for.
             await client.ConnectionChannel.ConnectAsync(transportId).ConfigureAwait(false);
             await client.ReceiverChannel.GetChromecastStatusAsync().ConfigureAwait(false);
+
+            // Clients send nothing when they disconnect from a cast target, and this keep-alive
+            // would otherwise hold an idle Jellyfin screen on the TV forever.
+            var idleFor = DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastActivityTicks), DateTimeKind.Utc);
+            if (!_receiverHasItem && idleFor > IdleCloseAfter)
+            {
+                _logger.LogInformation("Jellyfin receiver on {Name} has been idle for {IdleFor}, closing it", _receiver.Name, idleFor);
+                MarkActivity();
+                await CloseReceiverAppAsync().ConfigureAwait(false);
+            }
         }
         catch (Exception ex)
         {
@@ -276,6 +305,8 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
     private async Task SendPlayCommandCoreAsync(PlayRequest command, List<BaseItemDto> items, User? user, CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _castGeneration);
+
         // PlayNext/PlayLast mean "add to the queue of whatever is already casting" - they must
         // never go through the launch-a-fresh-app path below. Sending them there anyway (the
         // original bug: this method always launched fresh and sent "PlayNow" regardless of what
@@ -296,56 +327,83 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         // The receiver keeps its own internal queue from the full item list (like jellyfin-web's
         // Chrome sender does), so NextTrack/PreviousTrack below are just forwarded commands -
         // this controller does not need to track queue position itself.
-        var (accessToken, controllingUser) = await MintAccessTokenAsync(user, cancellationToken).ConfigureAwait(false);
+        var (accessToken, controllingUser) = await GetAccessTokenAsync(user, cancellationToken).ConfigureAwait(false);
         if (accessToken is null || controllingUser is null)
         {
             return;
         }
 
+        _logger.LogInformation("Casting {Count} item(s) starting with {ItemName} to {DeviceName}", items.Count, items[0].Name, _receiver.Name);
+
+        var (transportId, launched) = await EnsureReceiverAppAsync(client, cancellationToken).ConfigureAwait(false);
+        if (transportId is null)
+        {
+            return;
+        }
+
+        // "Identify" shows the receiver's own branded "ready" screen
+        // (DocumentManager.setAppStatus(Waiting)); only meaningful on a fresh launch.
+        if (launched)
+        {
+            await _connectSdkChannel.SendCommandAsync("Identify", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, null, transportId).ConfigureAwait(false);
+        }
+
+        var options = BuildPlayNowOptions(items, command.StartPositionTicks, command.MediaSourceId, command.AudioStreamIndex, command.SubtitleStreamIndex);
+        await _connectSdkChannel.SendCommandAsync("PlayNow", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, options, transportId).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Joins the Jellyfin receiver if it is already running on the device, otherwise launches it.
+    /// Relaunching on every cast (the previous behavior) discarded the receiver's own state -
+    /// notably its bitrate measurement, which it otherwise caches for 10 minutes and which costs
+    /// ~8 seconds of /Playback/BitrateTest downloads before every fresh playback.
+    /// </summary>
+    /// <returns>The app's transport id (null on failure), and whether it was freshly launched.</returns>
+    private async Task<(string? TransportId, bool Launched)> EnsureReceiverAppAsync(ChromecastClient client, CancellationToken cancellationToken)
+    {
         var config = Plugin.Instance?.Configuration ?? new PluginConfiguration();
         var appId = config.UseUnstableReceiver ? UnstableReceiverAppId : StableReceiverAppId;
 
-        _logger.LogInformation("Casting {Count} item(s) starting with {ItemName} to {DeviceName}", items.Count, items[0].Name, _receiver.Name);
+        var running = client.ChromecastStatus?.Applications?.FirstOrDefault(a => a.AppId == appId);
+        if (running is not null && running.TransportId == _appTransportId)
+        {
+            return (_appTransportId, false);
+        }
 
-        // SharpCaster's request/response matching (WaitingTasks) has no built-in timeout - if a
-        // response never arrives (a dropped packet, a device that doesn't answer a particular
-        // status request the way expected, ...) the awaited call hangs forever with no exception
-        // and no log output. Wrap with our own timeout so a flaky device degrades to a clear,
-        // recoverable failure instead of silently wedging this session's casting ability.
-        var launchTask = client.LaunchApplicationAsync(appId, joinExistingApplicationSession: false);
+        // SharpCaster's request/response matching has no built-in timeout - a response that never
+        // arrives would otherwise hang this call forever with no log output.
+        var launchTask = client.LaunchApplicationAsync(appId, joinExistingApplicationSession: true);
         var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
         var completed = await Task.WhenAny(launchTask, timeoutTask).ConfigureAwait(false);
         if (completed == timeoutTask)
         {
-            _logger.LogWarning("Timed out launching the Jellyfin receiver on {Name} - aborting cast", _receiver.Name);
+            _logger.LogWarning("Timed out launching the Jellyfin receiver on {Name}", _receiver.Name);
             InvalidateConnection();
-            return;
+            return (null, false);
         }
 
-        var launchStatus = await launchTask.ConfigureAwait(false);
-        var transportId = launchStatus?.Application?.TransportId;
+        var status = await launchTask.ConfigureAwait(false);
+        var transportId = status?.Applications?.FirstOrDefault(a => a.AppId == appId)?.TransportId;
         if (transportId is null)
         {
-            _logger.LogWarning("Chromecast {Name} did not report a running application after launch - aborting cast", _receiver.Name);
-            return;
+            _logger.LogWarning("Chromecast {Name} did not report the Jellyfin receiver running after launch", _receiver.Name);
+            return (null, false);
+        }
+
+        if (running is null)
+        {
+            _logger.LogInformation("Launched the Jellyfin receiver on {Name}", _receiver.Name);
+        }
+        else
+        {
+            _logger.LogInformation("Joined the already-running Jellyfin receiver on {Name}", _receiver.Name);
         }
 
         _appTransportId = transportId;
+        _receiverHasItem = true;
         client.HeartbeatChannel.AdditionalDestinationId = transportId;
         StartAppKeepAlive(client, transportId);
-
-        // "Identify" is what makes the receiver show its own branded "ready"/waiting screen
-        // (DocumentManager.setAppStatus(Waiting) in the receiver's own source) - without ever
-        // sending it, a fresh launch goes straight from blank/idle to loading media with no
-        // visible "connected" moment in between. Reported by the user as a regression ("the ready
-        // to cast screen doesn't show up any more, only once playback actually starts") - what
-        // they'd seen before was actually just residual state left over from the receiver having
-        // *just* finished a previous cast during heavy back-to-back testing, not anything this
-        // plugin was deliberately doing.
-        await _connectSdkChannel.SendCommandAsync("Identify", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, null, transportId).ConfigureAwait(false);
-
-        var options = BuildPlayNowOptions(items, command.StartPositionTicks, command.MediaSourceId, command.AudioStreamIndex, command.SubtitleStreamIndex);
-        await _connectSdkChannel.SendCommandAsync("PlayNow", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, options, transportId).ConfigureAwait(false);
+        return (transportId, running is null);
     }
 
     /// <summary>
@@ -418,7 +476,10 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             {
                 case PlaystateCommand.Stop:
                     await SendReceiverCommandAsync("Stop", null).ConfigureAwait(false);
-                    await RevokeAccessTokenAsync().ConfigureAwait(false);
+
+                    // Jellyfin holds the client's Stop request open until this returns, so don't
+                    // make it wait out the close delay.
+                    _ = CloseReceiverAppAsync();
                     break;
                 case PlaystateCommand.Pause:
                     await SendReceiverCommandAsync("Pause", null).ConfigureAwait(false);
@@ -450,6 +511,75 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }
     }
 
+    /// <summary>
+    /// Closes the Jellyfin receiver after an explicit Stop so the TV returns to its normal screen.
+    /// The receiver disables CAF's idle timeout and only exits once every sender disconnects, and
+    /// this plugin's own heartbeat/keep-alive would otherwise keep it on screen indefinitely.
+    /// </summary>
+    private async Task CloseReceiverAppAsync()
+    {
+        try
+        {
+            await CloseReceiverAppCoreAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error closing the Jellyfin receiver on {Name}", _receiver.Name);
+        }
+    }
+
+    private async Task CloseReceiverAppCoreAsync()
+    {
+        var generation = Interlocked.Increment(ref _castGeneration);
+        var client = _client;
+        if (client is null)
+        {
+            await RevokeAccessTokenAsync().ConfigureAwait(false);
+            return;
+        }
+
+        // Let the receiver report the stop to Jellyfin (with the token we're about to revoke).
+        await Task.Delay(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+
+        // A new cast arrived in the meantime - it owns the receiver now.
+        if (generation != Volatile.Read(ref _castGeneration) || !ReferenceEquals(_client, client))
+        {
+            return;
+        }
+
+        var appId = (Plugin.Instance?.Configuration ?? new PluginConfiguration()).UseUnstableReceiver ? UnstableReceiverAppId : StableReceiverAppId;
+        if (client.ChromecastStatus?.Application?.AppId == appId)
+        {
+            try
+            {
+                // No built-in timeout on SharpCaster requests; the device may also just drop the
+                // connection once the app is gone instead of answering.
+                await Task.WhenAny(client.ReceiverChannel.StopApplication(), Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false);
+                _logger.LogInformation("Closed the Jellyfin receiver on {Name}", _receiver.Name);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Error closing the Jellyfin receiver on {Name}", _receiver.Name);
+            }
+        }
+
+        if (ReferenceEquals(_client, client))
+        {
+            client.Disconnected -= OnClientDisconnected;
+            InvalidateConnection();
+            try
+            {
+                await client.DisconnectAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Error disconnecting from Chromecast {Name}", _receiver.Name);
+            }
+        }
+
+        await RevokeAccessTokenAsync().ConfigureAwait(false);
+    }
+
     private Task SendReceiverCommandAsync(string command, object? options)
     {
         if (_connectSdkChannel is null || _mintedAccessToken is null || _appTransportId is null)
@@ -465,6 +595,11 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         if (command is null)
         {
             return Task.CompletedTask;
+        }
+
+        if (command.Name == GeneralCommandType.DisplayContent)
+        {
+            return DisplayContentAsync(command, cancellationToken);
         }
 
         // Every Jellyfin sender (jellyfin-web's remote control, the mobile/TV apps' subtitle and
@@ -523,13 +658,67 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }
     }
 
-    private async Task<(string? AccessToken, User? User)> MintAccessTokenAsync(User? user, CancellationToken cancellationToken)
+    /// <summary>
+    /// Jellyfin clients send DisplayContent whenever an item page is opened while connected to a
+    /// remote player ("display mirroring", on by default). Connecting to a cast target itself sends
+    /// nothing to the server, so this is the earliest signal available: it starts (or joins) the
+    /// receiver so it shows the item and does its bitrate measurement while the user is still
+    /// browsing, instead of all of that happening after Play is pressed.
+    /// </summary>
+    private async Task DisplayContentAsync(GeneralCommand command, CancellationToken cancellationToken)
+    {
+        if (!command.Arguments.TryGetValue("ItemId", out var itemId) || string.IsNullOrEmpty(itemId))
+        {
+            return;
+        }
+
+        Interlocked.Increment(ref _castGeneration);
+
+        try
+        {
+            var client = await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
+            if (client is null || _connectSdkChannel is null)
+            {
+                return;
+            }
+
+            var user = command.ControllingUserId == Guid.Empty ? null : _userManager.GetUserById(command.ControllingUserId);
+            var (accessToken, controllingUser) = await GetAccessTokenAsync(user, cancellationToken).ConfigureAwait(false);
+            if (accessToken is null || controllingUser is null)
+            {
+                return;
+            }
+
+            var (transportId, _) = await EnsureReceiverAppAsync(client, cancellationToken).ConfigureAwait(false);
+            if (transportId is null)
+            {
+                return;
+            }
+
+            // The receiver ignores this while it's playing something, so it's safe to forward always.
+            await _connectSdkChannel.SendCommandAsync("DisplayContent", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, new DisplayContentOptions { ItemId = itemId }, transportId).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error sending DisplayContent to Chromecast {Name}", _receiver.Name);
+            InvalidateConnection();
+        }
+    }
+
+    private async Task<(string? AccessToken, User? User)> GetAccessTokenAsync(User? user, CancellationToken cancellationToken)
     {
         user ??= _userManager.GetUsers().FirstOrDefault(u => u.HasPermission(PermissionKind.IsAdministrator));
         if (user is null)
         {
             _logger.LogError("Cannot cast: no controlling user and no administrator fallback available");
             return (null, null);
+        }
+
+        // Reuse the live token: minting another for the same device id makes Jellyfin log out the
+        // previous one, which kills whatever the receiver is still streaming with it.
+        if (_mintedAccessToken is not null && _mintedTokenUserId == user.Id)
+        {
+            return (_mintedAccessToken, user);
         }
 
         // AuthenticateDirect mints a real, correctly-scoped session token for this user without a
@@ -547,6 +736,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }).ConfigureAwait(false);
 
         _mintedAccessToken = authResult.AccessToken;
+        _mintedTokenUserId = user.Id;
         return (authResult.AccessToken, user);
     }
 
@@ -619,6 +809,18 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         if (_disposed)
         {
             return;
+        }
+
+        if (status.Data is { ValueKind: JsonValueKind.Object } data
+            && data.TryGetProperty("ItemId", out var itemId)
+            && itemId.ValueKind == JsonValueKind.String)
+        {
+            _receiverHasItem = !string.IsNullOrEmpty(itemId.GetString());
+        }
+
+        if (status.Type == "playbackstop")
+        {
+            _receiverHasItem = false;
         }
 
         try

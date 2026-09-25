@@ -94,6 +94,21 @@ Wrapped the entire per-message body (namespace lookup through dispatch) in its o
 logs and continues to the next message, instead of letting anything escape to the loop-ending
 catch. A single malformed/unexpected message can now never take down the whole connection.
 
+### 5. A deliberate disconnect logged as an error with a stack trace
+
+`DisconnectAsync` cancels the receive loop's token, and the pending `SslStream` read then throws
+`OperationCanceledException` into the loop's catch-all, which logged `Error in receive loop: The
+operation was canceled.` at Error level with a full stack trace. The plugin now disconnects on
+purpose after every Stop (to let the receiver close), so this showed up on every stop. Added a
+`catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)` ahead of the
+catch-all that ends the loop quietly; any other failure still logs as before.
+
+Same patch, second part: the unsolicited `MEDIA_STATUS` broadcasts behind patch 4 (a `requestId`
+outside `System.Int32`) were still logged at Error with a full stack trace by patch 4's catch,
+several times per cast. The envelope deserialization into `MessageWithId` now catches
+`JsonException` itself, logs one Debug line (`Skipped unparseable message on {namespace}`), and
+moves on. Nothing ever waits on those broadcasts, so skipping them loses nothing.
+
 ## Keeping this in sync with upstream
 
 To pull in upstream fixes, re-copy `Sharpcaster/` from a fresh clone of the upstream repo and

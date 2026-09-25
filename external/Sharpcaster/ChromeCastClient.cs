@@ -73,6 +73,9 @@ namespace Sharpcaster
         private static readonly Action<ILogger, string, string, Exception?> LogChannelParseError =
             LoggerMessage.Define<string, string>(LogLevel.Error, new EventId(4008, "ChannelParseError"), "Couldn't parse the channel from: {NameSpace} : {Payload}");
 
+        private static readonly Action<ILogger, string, string, Exception?> LogSkippedUnparseableMessage =
+            LoggerMessage.Define<string, string>(LogLevel.Debug, new EventId(4012, "SkippedUnparseableMessage"), "Skipped unparseable message on {NameSpace}: {Message}");
+
         private static readonly Action<ILogger, string, Exception?> LogReceiveLoopError =
             LoggerMessage.Define<string>(LogLevel.Error, new EventId(4009, "ReceiveLoopError"), "Error in receive loop: {Message}");
 
@@ -248,7 +251,20 @@ namespace Sharpcaster
                             }
                             if (channel?.Logger != null) LogReceivedMessage(channel.Logger, payload, null);
 
-                            var message = JsonSerializer.Deserialize(payload, SharpcasteSerializationContext.Default.MessageWithId);
+                            Messages.MessageWithId? message;
+                            try
+                            {
+                                message = JsonSerializer.Deserialize(payload, SharpcasteSerializationContext.Default.MessageWithId);
+                            }
+                            catch (JsonException ex)
+                            {
+                                // Patch: receiver-originated broadcasts (CAF's own MEDIA_STATUS) can carry
+                                // a requestId outside Int32. Nothing waits on those, so skip quietly
+                                // instead of logging an error per broadcast. See PATCH.md.
+                                if (_logger != null) LogSkippedUnparseableMessage(_logger, castMessage.Namespace, ex.Message, null);
+                                continue;
+                            }
+
                             if (message != null && MessageTypes.TryGetValue(message.Type, out Type? type))
                             {
                                 try
@@ -294,6 +310,11 @@ namespace Sharpcaster
                         if (_logger != null) LogExceptionProcessingResponse(_logger, ex.Message, ex);
                     }
                 }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Our own DisconnectAsync cancelled the read - a normal shutdown, not an error.
+                ReceiveTcs.SetResult(true);
             }
             catch (Exception exception)
             {

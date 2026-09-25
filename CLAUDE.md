@@ -611,16 +611,90 @@ it silently reproduces this exact bug. Worth revisiting: a small check/script th
 if `Directory.Build.props`'s `<Version>` doesn't match `manifest.json`'s newest entry, since this
 already slipped through once.
 
+### RESOLVED: ~12 s from Play to video; no Jellyfin screen on connect; screen lingers after disconnect
+
+Reported together by the user: connecting to the Chromecast in the Jellyfin UI didn't show the
+receiver's "ready" screen (it only appeared after pressing Play), the media then took ~10 s to
+start, and disconnecting stopped playback but left the Jellyfin screen on the TV until it
+"automatically dismissed".
+
+**What clients actually send (jellyfin-web source, `plugins/sessionPlayer/plugin.js`,
+`components/playback/playerSelectionMenu.js`, `apps/modern/.../RemotePlayActiveMenu.tsx`):
+nothing, on either connect or disconnect.** Selecting a remote session target just resolves
+`sessionPlayer.tryPair()` locally and starts listening for session updates; disconnecting just
+switches back to the local player. The only exception is `EndSession`: if a target advertises it,
+Disconnect offers "end session on device?" and calls `player.endSession()` - but the session player
+has no `endSession()`, so advertising it would throw and break Disconnect. **Do not advertise
+`EndSession`.** So "show the ready screen the moment you connect" is impossible from a server
+plugin; that part is a Jellyfin client limitation.
+
+What *is* available: clients send `DisplayContent` (`{ItemId, ItemName, ItemType}`) whenever an
+item page is opened while connected to a remote player that advertises it ("display mirroring",
+`displayMirrorManager.ts`, on by default - `appSettings 'displaymirror' !== '0'`). The plugin now
+advertises it and handles it (`DisplayContentAsync`): join-or-launch the receiver and forward the
+receiver's own `DisplayContent` command (options `{ "ItemId": ... }`, PascalCase - its
+`DisplayRequest` type), which shows that item on the TV while idle and is ignored while playing.
+
+**Where the ~12 s went** (measured from the request log): ~2.5 s connect+launch, **~8.5 s of
+`/Playback/BitrateTest` downloads** (the receiver's `getMaxBitrate()` measures bandwidth before its
+first PlaybackInfo call - 15 requests up to 8-10 MB), ~1 s to first segment. The receiver caches
+the measured bitrate for 10 minutes, and its first message also triggers
+`reportDeviceCapabilities()` (which measures too) - but the plugin relaunched the receiver
+(`joinExistingApplicationSession: false`) on every cast, throwing that state away. Fixes:
+- `EnsureReceiverAppAsync` joins an already-running receiver instead of relaunching (and picks the
+  transport id by our app id, not `Applications[0]`). `Identify` is only sent on a fresh launch.
+- With DisplayContent, the launch and the bandwidth test happen while the user is on the item page.
+  **Measured: Play → first video request ~1.0 s** (was ~12 s). Without a prior item-page view (e.g.
+  pressing Play right after connecting) the first cast is still slow; later ones within 10 minutes
+  are fast because the receiver stays up.
+- `GetAccessTokenAsync` reuses the live minted token. `AuthenticateDirect` with the same device id
+  logs out the previous token (seen as `Logging out access token` right before `Creating new
+  access token`), which would kill a stream still running on the old token - e.g. a DisplayContent
+  from browsing while something plays.
+
+**Lingering screen:** the receiver sets CAF's `disableIdleTimeout = true` (`maincontroller.ts`),
+so it only exits when every sender disconnects - and this plugin's heartbeat plus 5 s keep-alive
+never disconnect. Fixes:
+- `Stop` now sends the receiver's `Stop`, then (in the background - Jellyfin holds the client's
+  Stop HTTP request open until the controller returns, measured 2+ s) `CloseReceiverAppAsync`:
+  wait 2 s so the receiver can report `/Sessions/Playing/Stopped` with its token, then
+  `ReceiverChannel.StopApplication()` (5 s timeout - no built-in one), disconnect, revoke the token.
+  A `_castGeneration` counter bumped by every cast/DisplayContent makes a pending close back off if
+  a new cast arrives in those 2 s (verified: Stop then Play 0.5 s later keeps playing on the same
+  receiver instance).
+- Idle close in the keep-alive tick: if the receiver has reported no loaded item and no command
+  arrived for 3 minutes (`IdleCloseAfter`), close it. This covers "browsed (DisplayContent), then
+  disconnected" and "movie ended". `_receiverHasItem` is only cleared on positive evidence (a
+  broadcast with an empty `ItemId`, or `playbackstop`) and reset to true on every launch, so an
+  unexpected broadcast shape can never get a playing or paused movie closed.
+
+Also found along the way: `PluginConfiguration.AccessTokenLifetimeMinutes` (the "safety net"
+described under "Access tokens") is not read anywhere - there is no fallback expiry. And switching
+`UseUnstableReceiver` while a cast is running made the next LAUNCH replace the app; the device then
+closed our connection mid-request (`Client disconnected before receiving response`). That is a
+plausible cause of the user's "stream breaks under rapid switching" report; joining instead of
+relaunching removes the same-app variant of it, but it is not confirmed as the cause.
+
 ### Still open
 
+- **Stable receiver can't load external subtitle files** until upstream tags a release containing
+  jellyfin-chromecast `6be49ae` - see the subtitles section. Until then `UseUnstableReceiver` is
+  needed for external `.srt`/`.ass` files.
+- **Discovery intermittently misses a device.** Eettafel TV repeatedly went unseen by the plugin's
+  Zeroconf scans for 2-3 minutes at a time (long enough to be marked inactive at 120 s) while
+  macOS's `dns-sd -B _googlecast._tcp` still listed it and its cast port answered. Worth looking at
+  (Zeroconf query behavior, or a longer stale timeout) - possibly related to the rapid-switching
+  report too.
+- `PluginConfiguration.AccessTokenLifetimeMinutes` is unused (see above) - implement or remove.
+- The minted token's device id is `"chromecast-" + _session.DeviceId`, but the session's device id
+  already starts with `chromecast-`, giving a third session named `chromecast-chromecast-...` in
+  `/Sessions`. Cosmetic.
 - Decide whether the `HeartbeatChannel.AdditionalDestinationId` patch and the plugin's own 5s
   keep-alive timer are still worth keeping now that the real fix (patch 4, the receive-loop
   try/catch) is in - they were reasonable hardening added while still hypothesizing about the
   cause, not proven necessary on their own. Low priority to revisit; they're harmless as-is.
-- Consider proposing the four Sharpcaster patches upstream (see `external/Sharpcaster/PATCH.md`)
+- Consider proposing the Sharpcaster patches upstream (see `external/Sharpcaster/PATCH.md`)
   to eventually drop the vendoring.
-- Write real user-facing installation instructions (README currently just points here) once ready
-  to cut an actual release/manifest entry.
 - The Jellyfin dashboard's own "Stop" button was reported not working during testing - the user
   confirmed this is a pre-existing Jellyfin UI issue unrelated to this plugin (Stop via the
   `/Sessions/{id}/Playing/Stop` API works correctly, confirmed repeatedly).

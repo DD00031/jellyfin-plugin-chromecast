@@ -88,6 +88,19 @@ public sealed class SeekOptions
 }
 
 /// <summary>
+/// The options payload for the "DisplayContent" receiver command - the receiver's
+/// <c>DisplayRequest</c> interface uses PascalCase <c>ItemId</c>, unlike the envelope.
+/// </summary>
+public sealed class DisplayContentOptions
+{
+    /// <summary>
+    /// Gets or sets the id of the item to show.
+    /// </summary>
+    [JsonPropertyName("ItemId")]
+    public required string ItemId { get; set; }
+}
+
+/// <summary>
 /// The options payload for the "SetAudioStreamIndex"/"SetSubtitleStreamIndex" receiver commands.
 /// Matches the receiver's <c>SetIndexRequest</c> interface (<c>types/global.d.ts</c>) - unlike
 /// most other options payloads in this file, that interface uses a single lowercase <c>index</c>

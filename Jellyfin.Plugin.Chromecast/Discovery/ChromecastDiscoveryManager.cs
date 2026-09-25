@@ -188,8 +188,13 @@ public sealed class ChromecastDiscoveryManager : IDisposable
             // details page hides its whole version/audio/subtitle block unless the active
             // player advertises PlayMediaSource, and its remote-control UI checks
             // SetAudioStreamIndex/SetSubtitleStreamIndex before offering track switching.
+            // DisplayContent enables the clients' "display mirroring" (on by default), which is the
+            // only signal the server gets before Play that someone is casting here. EndSession is
+            // deliberately absent: jellyfin-web's session player has no endSession(), so
+            // advertising it would break the Disconnect button.
             SupportedCommands = new[]
             {
+                GeneralCommandType.DisplayContent,
                 GeneralCommandType.PlayMediaSource,
                 GeneralCommandType.SetAudioStreamIndex,
                 GeneralCommandType.SetSubtitleStreamIndex,
