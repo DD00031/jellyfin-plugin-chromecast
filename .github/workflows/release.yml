@@ -1,0 +1,121 @@
+name: Release
+
+# Run from GitHub: Actions -> Release -> Run workflow. Builds the plugin against the exact
+# Jellyfin server version you enter (plugin builds only load on the server version they were
+# built for), bumps the plugin version, and publishes a release plus manifest.json entry so
+# servers using this repository see the update.
+
+on:
+  workflow_dispatch:
+    inputs:
+      jellyfin_version:
+        description: "Your Jellyfin server version, exactly (e.g. 12.0.1)"
+        required: true
+      plugin_version:
+        description: "Plugin version (e.g. 0.1.4.0) - leave empty to bump the last number"
+        required: false
+        default: ""
+      changelog:
+        description: 'Changelog - leave empty for "Rebuilt for Jellyfin <version>."'
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run: build and package only, no commit, tag or release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Bump versions
+        id: bump
+        env:
+          JELLYFIN_VERSION: ${{ inputs.jellyfin_version }}
+          PLUGIN_VERSION: ${{ inputs.plugin_version }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: python3 .github/scripts/release.py prepare
+
+      - name: Check the release doesn't exist yet
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" > /dev/null; then
+            echo "::error::Tag v$VERSION already exists"
+            exit 1
+          fi
+
+      - name: Build
+        env:
+          JELLYFIN_VERSION: ${{ inputs.jellyfin_version }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          PROJECT=Jellyfin.Plugin.Chromecast/Jellyfin.Plugin.Chromecast.csproj
+          dotnet build -c Release -p:JellyfinServerVersion="$JELLYFIN_VERSION" "$PROJECT"
+          ACTUAL=$(dotnet build -c Release -p:JellyfinServerVersion="$JELLYFIN_VERSION" "$PROJECT" -getProperty:AssemblyVersion)
+          if [ "$ACTUAL" != "$VERSION" ]; then
+            echo "::error::Built assembly version is $ACTUAL, expected $VERSION"
+            exit 1
+          fi
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          mkdir -p dist
+          ZIP="dist/Jellyfin.Plugin.Chromecast_$VERSION.zip"
+          zip -j "$ZIP" Jellyfin.Plugin.Chromecast/bin/Release/net10.0/*.dll
+          unzip -l "$ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "checksum=$(md5sum "$ZIP" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Add manifest entry
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          TARGET_ABI: ${{ steps.bump.outputs.target_abi }}
+          CHANGELOG: ${{ steps.bump.outputs.changelog }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: python3 .github/scripts/release.py manifest
+
+      - name: Show changes
+        run: git diff
+
+      - name: Upload package (dry run)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ steps.bump.outputs.version }}
+          path: dist/*.zip
+
+      - name: Commit, tag and publish
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          JELLYFIN_VERSION: ${{ inputs.jellyfin_version }}
+          CHANGELOG: ${{ steps.bump.outputs.changelog }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Directory.Build.props Jellyfin.Plugin.Chromecast/Jellyfin.Plugin.Chromecast.csproj build.yaml README.md manifest.json
+          git commit -m "Release $VERSION for Jellyfin $JELLYFIN_VERSION"
+          git tag "v$VERSION"
+          git push origin HEAD:${{ github.ref_name }} "v$VERSION"
+          gh release create "v$VERSION" "$ZIP" --title "$VERSION" --notes "$CHANGELOG
+
+          Built for Jellyfin $JELLYFIN_VERSION."
