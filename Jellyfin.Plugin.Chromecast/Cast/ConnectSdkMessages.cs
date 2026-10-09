@@ -55,6 +55,12 @@ public sealed class PlayNowOptions
     public required IReadOnlyList<JsonElement> Items { get; set; }
 
     /// <summary>
+    /// Gets or sets which of <see cref="Items"/> to start with; null for the first.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? StartIndex { get; set; }
+
+    /// <summary>
     /// Gets or sets the position (in ticks) to start playback from.
     /// </summary>
     [JsonPropertyName("startPositionTicks")]

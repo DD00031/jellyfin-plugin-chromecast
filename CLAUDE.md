@@ -771,6 +771,37 @@ Also in this round:
 
 All verified on the 12.2.0 test server against Eettafel TV.
 
+### RESOLVED (2026-10-09): devices dropping out of the menu, rapid switching, "play from here", sessions
+
+- **Chromecasts vanished from the cast menu for minutes.** `ChromecastLocator.FindReceiversAsync`
+  listens 400 ms and stops as soon as *any* device answered ("completed early at check 1"), so
+  with two Chromecasts the slower one is regularly missed. The manager now passes 3 s for every
+  stage - but that alone is not enough: even then 2-3 of 10 scans saw only one device (mDNS
+  answers do get lost). The real fix is in `SweepStaleDevices`: before a device is marked stale it
+  must also fail a direct TCP connect to its cast port (2 s) and have no open receiver. Verified
+  with `DeviceStaleAfterSeconds` at its 30 s minimum: scans missed a device twice, nothing was
+  dropped. The stale log line is now written once per transition instead of on every sweep.
+- **Rapid switching ended on the wrong video.** The receiver handles each `PlayNow`
+  independently and awaits its own PlaybackInfo call before loading, so when requests arrive close
+  together the stream that becomes ready last wins, not the last one requested (10 casts 2 s
+  apart ended on the 9th, a slow-starting transcode). `SendPlayCommandCoreAsync` now keeps one
+  `PlayNow` in flight: a newer request is parked in `_pendingPlay` (only the newest is kept) until
+  the receiver broadcasts the item it was asked to load, reports an error, or 15 s pass
+  (`OnReceiverReported`, also polled from the keep-alive tick). Stop and connection loss clear
+  both. Verified: 10 casts at 2 s, 8 at 0.5 s (4 actually sent) and 6 at 4 s all ended on the last
+  request, with no relaunches, disconnects or errors. Together with joining instead of relaunching
+  the receiver, this is the likely fix for the user's original "streams break when switching
+  intensively" report; not yet confirmed by them.
+- **"Play from here"** always started at the first item: `PlayRequest.StartIndex` is now forwarded
+  as `startIndex`, and the media-source fill-in uses that item.
+- **One user session per cast instead of two.** The token is minted as client `Chromecast` with
+  device id `btoa(receiverName)` (Latin-1 base64, `GetReceiverDeviceId`) - the identity the
+  receiver reports itself - so Jellyfin's session key (client, device id, user) is the same for
+  the token and the receiver. `/Sessions` now shows the plugin's menu entry (no user) plus one
+  session for the casting user.
+- **Upstream receiver**: latest tag is still v1.3.1 (2026-09-20), which lacks the external
+  subtitle fix `6be49ae`, so `UseUnstableReceiver` stays on by default.
+
 ### Investigated, fixed by server config (not this plugin): subtitles drift after seeking
 
 Reported: subtitles are in sync when playback just runs, but lag after seeking. Reproduced
@@ -806,33 +837,20 @@ the unstable default.
 ### Still open
 
 - **Stable receiver can't load external subtitle files** until upstream tags a release containing
-  jellyfin-chromecast `6be49ae` - see the subtitles section. `UseUnstableReceiver` therefore
-  defaults to **true** since 0.1.3.0 (a saved `false` from an older install is kept, since
-  `XmlSerializer` can't tell it from a deliberate choice). Once upstream tags that fix, consider
-  switching the default back to stable.
-- **Discovery intermittently misses a device.** Eettafel TV repeatedly went unseen by the plugin's
-  Zeroconf scans for 2-3 minutes at a time (long enough to be marked inactive at 120 s) while
-  macOS's `dns-sd -B _googlecast._tcp` still listed it and its cast port answered. Worth looking at
-  (Zeroconf query behavior, or a longer stale timeout) - possibly related to the rapid-switching
-  report too.
-- **Sessions per cast.** Each cast leaves the user with two extra Jellyfin sessions (the minted
-  token's `chromecast-chromecast-...` one and the receiver's own `base64(name)` one). Minting with
-  the device id the receiver will use (`btoa(receiverName)`, Latin-1) and its client name would
-  merge them into one and halve the hit on session limits - untested.
-- **StartIndex is not forwarded** in `PlayNowOptions`, so "play from here" in a list always starts
-  at the first item.
-- The first cast after connecting without opening an item page still pays the receiver's ~8 s
-  bandwidth test unless the connect guess already opened it. Passing `maxBitrate` in the envelope
-  would skip it at the cost of the automatic measurement.
-- Decide whether the `HeartbeatChannel.AdditionalDestinationId` patch and the plugin's own 5s
-  keep-alive timer are still worth keeping now that the real fix (patch 4, the receive-loop
-  try/catch) is in - they were reasonable hardening added while still hypothesizing about the
-  cause, not proven necessary on their own. Low priority to revisit; they're harmless as-is.
+  jellyfin-chromecast `6be49ae` (latest tag checked 2026-10-09: v1.3.1, without it).
+  `UseUnstableReceiver` therefore defaults to **true** (a saved `false` from an older install is
+  kept). Once upstream tags that fix, consider switching the default back to stable.
+- **Not yet verified by eye**: the ready screen appearing on connect, the settings page's look,
+  and subtitle sync after seeking on the TV. Also untested: the wrong-guess correction with two
+  Chromecasts in use, the iOS app itself (same web client), and Jellyfin 12.1.
+- The first cast after connecting pays the receiver's ~8 s bandwidth test if the connect guess
+  didn't already open it. Passing `maxBitrate` in the envelope would skip it at the cost of the
+  automatic measurement.
 - Consider proposing the Sharpcaster patches upstream (see `external/Sharpcaster/PATCH.md`)
-  to eventually drop the vendoring.
+  to eventually drop the vendoring. The 5 s keep-alive tick is no longer optional hardening: the
+  idle close and the stalled-play-request check run from it.
 - The Jellyfin dashboard's own "Stop" button was reported not working during testing - the user
-  confirmed this is a pre-existing Jellyfin UI issue unrelated to this plugin (Stop via the
-  `/Sessions/{id}/Playing/Stop` API works correctly, confirmed repeatedly).
+  confirmed this is a pre-existing Jellyfin UI issue unrelated to this plugin.
 
 ## Building
 

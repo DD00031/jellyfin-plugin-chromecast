@@ -116,6 +116,24 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
     private Guid _lastControllingUserId;
 
+    /// <summary>
+    /// Guards the three fields below. The receiver handles each PlayNow independently and awaits
+    /// its own PlaybackInfo call before loading, so when two arrive close together the one whose
+    /// stream is ready last wins - not the one requested last (seen in testing: ten quick casts
+    /// ended on the ninth, a slow-starting transcode). So only one PlayNow is in flight at a time:
+    /// a newer request waits until the receiver reports the previous item, and only the newest
+    /// waiting request is kept.
+    /// </summary>
+    private readonly object _playLock = new();
+
+    private static readonly TimeSpan LoadTimeout = TimeSpan.FromSeconds(15);
+
+    private Guid _loadingItemId;
+
+    private DateTime _loadingSince;
+
+    private (PlayRequest Command, List<BaseItemDto> Items, User? User)? _pendingPlay;
+
     private DateTime _lastNotification;
 
     /// <summary>The user this receiver was opened for on a connect guess, until a real command confirms it.</summary>
@@ -292,6 +310,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         _connectSdkChannel = null;
         _appTransportId = null;
         StopAppKeepAlive();
+        ForgetPlayRequests();
     }
 
     /// <summary>
@@ -359,6 +378,9 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             await client.ConnectionChannel.ConnectAsync(transportId).ConfigureAwait(false);
             await client.ReceiverChannel.GetChromecastStatusAsync().ConfigureAwait(false);
 
+            // Lets a waiting play request through if the receiver never reported the previous one.
+            OnReceiverReported(string.Empty, Guid.Empty);
+
             // Clients send nothing when they disconnect from a cast target, and this keep-alive
             // would otherwise hold an idle Jellyfin screen on the TV forever.
             var idleFor = DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastActivityTicks), DateTimeKind.Utc);
@@ -392,11 +414,93 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             return;
         }
 
+        var firstItemId = items[command.StartIndex is { } start && start > 0 && start < items.Count ? start : 0].Id;
+        lock (_playLock)
+        {
+            if (_loadingItemId != Guid.Empty && DateTime.UtcNow - _loadingSince < LoadTimeout)
+            {
+                _pendingPlay = (command, items, user);
+                _logger.LogDebug("{Name} is still loading the previous request; {ItemName} will follow", _receiver.Name, items[0].Name);
+                return;
+            }
+
+            _loadingItemId = firstItemId;
+            _loadingSince = DateTime.UtcNow;
+        }
+
+        var sent = false;
+        try
+        {
+            sent = await SendPlayNowAsync(command, items, user, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (!sent)
+            {
+                ClearLoading(firstItemId);
+            }
+        }
+    }
+
+    private void ClearLoading(Guid itemId)
+    {
+        lock (_playLock)
+        {
+            if (_loadingItemId == itemId)
+            {
+                _loadingItemId = Guid.Empty;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Called for every receiver status broadcast: once the receiver reports the item it was
+    /// asked to load (or an error), the next waiting play request may go out.
+    /// </summary>
+    private void OnReceiverReported(string type, Guid itemId)
+    {
+        (PlayRequest Command, List<BaseItemDto> Items, User? User)? next;
+        lock (_playLock)
+        {
+            if (_loadingItemId == Guid.Empty)
+            {
+                return;
+            }
+
+            var stalled = DateTime.UtcNow - _loadingSince >= LoadTimeout;
+            var reported = type is "error" or "connectionerror" || (itemId == _loadingItemId && type is "playbackstart" or "playbackprogress" or "playstatechange");
+            if (!reported && !stalled)
+            {
+                return;
+            }
+
+            _loadingItemId = Guid.Empty;
+            next = _pendingPlay;
+            _pendingPlay = null;
+        }
+
+        if (next is { } pending)
+        {
+            _ = SendPlayCommand(pending.Command, CancellationToken.None);
+        }
+    }
+
+    private void ForgetPlayRequests()
+    {
+        lock (_playLock)
+        {
+            _loadingItemId = Guid.Empty;
+            _pendingPlay = null;
+        }
+    }
+
+    private async Task<bool> SendPlayNowAsync(PlayRequest command, List<BaseItemDto> items, User? user, CancellationToken cancellationToken)
+    {
         var client = await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
         if (client is null || _connectSdkChannel is null)
         {
             NotifyUser(command.ControllingUserId, $"Couldn't reach {DisplayName}. Check that it is switched on and on the same network as the server.");
-            return;
+            return false;
         }
 
         // The receiver keeps its own internal queue from the full item list (like jellyfin-web's
@@ -405,7 +509,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         var (accessToken, controllingUser) = await GetAccessTokenAsync(user, cancellationToken).ConfigureAwait(false);
         if (accessToken is null || controllingUser is null)
         {
-            return;
+            return false;
         }
 
         _logger.LogInformation("Casting {Count} item(s) starting with {ItemName} to {DeviceName}", items.Count, items[0].Name, _receiver.Name);
@@ -414,7 +518,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         if (transportId is null)
         {
             NotifyUser(command.ControllingUserId, $"{DisplayName} didn't open the Jellyfin app. Try again in a moment.");
-            return;
+            return false;
         }
 
         // "Identify" shows the receiver's own branded "ready" screen
@@ -424,8 +528,9 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             await _connectSdkChannel.SendCommandAsync("Identify", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, null, transportId).ConfigureAwait(false);
         }
 
-        var options = BuildPlayNowOptions(items, command.StartPositionTicks, command.MediaSourceId, command.AudioStreamIndex, command.SubtitleStreamIndex);
+        var options = BuildPlayNowOptions(items, command);
         await _connectSdkChannel.SendCommandAsync("PlayNow", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, options, transportId).ConfigureAwait(false);
+        return true;
     }
 
     /// <summary>
@@ -503,22 +608,26 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         var receiverCommand = command.PlayCommand == PlayCommand.PlayNext ? "PlayNext" : "PlayLast";
         _logger.LogInformation("Adding {Count} item(s) to the Chromecast queue ({Command}) on {DeviceName}", items.Count, receiverCommand, _receiver.Name);
 
-        var options = BuildPlayNowOptions(items, command.StartPositionTicks, command.MediaSourceId, command.AudioStreamIndex, command.SubtitleStreamIndex);
+        var options = BuildPlayNowOptions(items, command);
         return _connectSdkChannel.SendCommandAsync(receiverCommand, _session.UserId, _mintedAccessToken, _serverAddress, _receiver.Name, options, _appTransportId);
     }
 
-    private static PlayNowOptions BuildPlayNowOptions(List<BaseItemDto> items, long? startPositionTicks, string? mediaSourceId, int? audioStreamIndex, int? subtitleStreamIndex)
+    private static PlayNowOptions BuildPlayNowOptions(List<BaseItemDto> items, PlayRequest command)
     {
+        // "Play from here" in a list sends the whole list plus the index to start at.
+        var startIndex = command.StartIndex is { } index && index > 0 && index < items.Count ? index : 0;
+
         return new PlayNowOptions
         {
             // PascalCase, matching Jellyfin's normal API casing - see the XML doc on
             // PlayNowOptions.Items for why this must not go through the envelope's camelCase
             // serializer options.
             Items = items.Select(item => JsonSerializer.SerializeToElement(item, ApiJsonOptions)).ToList(),
-            StartPositionTicks = startPositionTicks,
-            MediaSourceId = ResolveMediaSourceId(items[0], mediaSourceId, audioStreamIndex, subtitleStreamIndex),
-            AudioStreamIndex = audioStreamIndex,
-            SubtitleStreamIndex = subtitleStreamIndex
+            StartIndex = startIndex == 0 ? null : startIndex,
+            StartPositionTicks = command.StartPositionTicks,
+            MediaSourceId = ResolveMediaSourceId(items[startIndex], command.MediaSourceId, command.AudioStreamIndex, command.SubtitleStreamIndex),
+            AudioStreamIndex = command.AudioStreamIndex,
+            SubtitleStreamIndex = command.SubtitleStreamIndex
         };
     }
 
@@ -554,6 +663,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
                     // The receiver returns to its "ready" screen on its own. It stays open (and the
                     // token stays valid - its backdrop rotation still uses it) until the client
                     // disconnects; see OnRemoteControlEndedAsync.
+                    ForgetPlayRequests();
                     await SendReceiverCommandAsync("Stop", null).ConfigureAwait(false);
                     break;
                 case PlaystateCommand.Pause:
@@ -610,6 +720,11 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     /// Gets the Chromecast's network address.
     /// </summary>
     public string Host => _receiver.DeviceUri.Host;
+
+    /// <summary>
+    /// Gets the Chromecast's cast port.
+    /// </summary>
+    public int Port => _receiver.Port;
 
     /// <summary>
     /// Gets a value indicating whether the Chromecast answered a recent discovery scan.
@@ -1005,6 +1120,18 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }
     }
 
+    /// <summary>
+    /// The device id Jellyfin's receiver gives itself: JavaScript's <c>btoa(receiverName)</c>, which
+    /// encodes the name as Latin-1. Names btoa can't encode fall back to an id of our own.
+    /// </summary>
+    private string GetReceiverDeviceId()
+    {
+        var name = _receiver.Name;
+        return name.All(c => c <= 0xFF)
+            ? Convert.ToBase64String(System.Text.Encoding.Latin1.GetBytes(name))
+            : "chromecast-receiver-" + _session.DeviceId;
+    }
+
     private async Task<(string? AccessToken, User? User)> GetAccessTokenAsync(User? user, CancellationToken cancellationToken)
     {
         user ??= _userManager.GetUsers().FirstOrDefault(u => u.HasPermission(PermissionKind.IsAdministrator));
@@ -1032,9 +1159,12 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             {
                 UserId = user.Id,
                 Username = user.Username,
-                App = "Jellyfin Chromecast Plugin",
+                // Sign in under the identity the receiver itself will report (client "Chromecast",
+                // device id btoa(receiverName)), so Jellyfin keeps one session for the cast instead
+                // of one for this token plus one for the receiver using it.
+                App = "Chromecast",
                 AppVersion = _appHost.ApplicationVersionString,
-                DeviceId = "chromecast-" + _session.DeviceId,
+                DeviceId = GetReceiverDeviceId(),
                 DeviceName = _receiver.Name
             }).ConfigureAwait(false);
         }
@@ -1138,6 +1268,16 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         {
             _receiverHasItem = false;
         }
+
+        var reportedItemId = Guid.Empty;
+        if (status.Data is { ValueKind: JsonValueKind.Object } statusData
+            && statusData.TryGetProperty("ItemId", out var reportedItem)
+            && reportedItem.ValueKind == JsonValueKind.String)
+        {
+            Guid.TryParse(reportedItem.GetString(), out reportedItemId);
+        }
+
+        OnReceiverReported(status.Type, reportedItemId);
 
         try
         {

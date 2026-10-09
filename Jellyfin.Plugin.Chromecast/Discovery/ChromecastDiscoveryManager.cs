@@ -40,6 +40,8 @@ public sealed class ChromecastDiscoveryManager : IDisposable
     private readonly ConcurrentDictionary<string, DateTime> _lastSeen = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _addDeviceLock = new(1, 1);
     private readonly Timer _staleSweepTimer;
+    private static readonly TimeSpan ScanTime = TimeSpan.FromSeconds(3);
+
     private readonly CancellationTokenSource _loopCts = new();
     private bool _disposed;
 
@@ -96,7 +98,10 @@ public sealed class ChromecastDiscoveryManager : IDisposable
         {
             try
             {
-                var receivers = await _locator.FindReceiversAsync().ConfigureAwait(false);
+                // By default the locator listens for 400 ms and stops as soon as *any* device has
+                // answered, so with several Chromecasts a slower one is regularly missed - often
+                // enough in a row to be dropped from the cast menu. One full-length listen instead.
+                var receivers = await _locator.FindReceiversAsync(ScanTime, ScanTime, ScanTime).ConfigureAwait(false);
                 foreach (var receiver in receivers)
                 {
                     await ProcessReceiverAsync(receiver).ConfigureAwait(false);
@@ -277,7 +282,7 @@ public sealed class ChromecastDiscoveryManager : IDisposable
         return "chromecast-" + Convert.ToHexString(bytes);
     }
 
-    private void SweepStaleDevices(object? state)
+    private async void SweepStaleDevices(object? state)
     {
         if (_disposed)
         {
@@ -297,16 +302,41 @@ public sealed class ChromecastDiscoveryManager : IDisposable
                     continue;
                 }
 
-                if (_lastSeen.TryGetValue(session.DeviceId, out var lastSeen) && now - lastSeen > maxAge)
+                if (!controller.IsOnline || !_lastSeen.TryGetValue(session.DeviceId, out var lastSeen) || now - lastSeen <= maxAge)
                 {
-                    _logger.LogInformation("Chromecast {Name} has not responded to discovery in {Age}, marking session inactive", session.DeviceName, now - lastSeen);
-                    controller.MarkStale();
+                    continue;
                 }
+
+                // mDNS answers get lost; only drop a device that really is gone. An open cast
+                // connection or an answering cast port means it is still there.
+                if (controller.IsReceiverOpen || await IsReachableAsync(controller.Host, controller.Port).ConfigureAwait(false))
+                {
+                    _lastSeen[session.DeviceId] = DateTime.UtcNow;
+                    continue;
+                }
+
+                _logger.LogInformation("Chromecast {Name} has not responded in {Age}, removing it from the cast menu until it is back", session.DeviceName, now - lastSeen);
+                controller.MarkStale();
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error while sweeping for stale Chromecast sessions");
+        }
+    }
+
+    private static async Task<bool> IsReachableAsync(string host, int port)
+    {
+        try
+        {
+            using var client = new System.Net.Sockets.TcpClient();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await client.ConnectAsync(host, port, timeout.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
         }
     }
 
