@@ -32,6 +32,8 @@ public sealed class RemoteControlListener : IWebSocketListener
 
     private readonly ISessionManager _sessionManager;
     private readonly ILogger<RemoteControlListener> _logger;
+    private static readonly ConcurrentDictionary<Guid, (Guid ItemId, DateTime At)> RecentLocalStops = new();
+
     private readonly ConcurrentDictionary<IWebSocketConnection, ConnectionState> _connections = new();
 
     /// <summary>
@@ -43,6 +45,32 @@ public sealed class RemoteControlListener : IWebSocketListener
     {
         _sessionManager = sessionManager;
         _logger = logger;
+        _sessionManager.PlaybackStopped += OnPlaybackStopped;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="userId"/> stopped playing <paramref name="itemId"/> in a Jellyfin
+    /// app within the last few seconds - which is what a transfer to a cast target looks like:
+    /// the app stops its own player and sends the item on with the position it had reached.
+    /// </summary>
+    /// <param name="userId">The user.</param>
+    /// <param name="itemId">The item.</param>
+    /// <returns>True if that playback ended moments ago.</returns>
+    public static bool WasJustPlayedLocally(Guid userId, Guid itemId)
+        => RecentLocalStops.TryGetValue(userId, out var stop) && stop.ItemId == itemId && DateTime.UtcNow - stop.At < TimeSpan.FromSeconds(15);
+
+    private static void OnPlaybackStopped(object? sender, MediaBrowser.Controller.Library.PlaybackStopEventArgs e)
+    {
+        // Only playback in a Jellyfin app's own player counts, not the receiver's.
+        if (e.Item is null || e.Session is null || string.Equals(e.Session.Client, "Chromecast", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        foreach (var user in e.Users)
+        {
+            RecentLocalStops[user.Id] = (e.Item.Id, DateTime.UtcNow);
+        }
     }
 
     /// <inheritdoc />

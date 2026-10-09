@@ -37,22 +37,28 @@ public class ChromecastController : ControllerBase
     /// <returns>The discovered Chromecasts.</returns>
     [HttpGet("Devices")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public ActionResult<IEnumerable<ChromecastDeviceInfo>> GetDevices()
+    public async Task<ActionResult<IEnumerable<ChromecastDeviceInfo>>> GetDevices()
     {
-        return Ok(GetControllers()
-            .Select(c => new ChromecastDeviceInfo
+        // Ask each device directly, so the list is right at the moment it is opened rather than
+        // whenever discovery last got round to noticing a change.
+        var devices = await Task.WhenAll(GetControllers().Select(async c =>
+        {
+            var online = c.IsOnline && await c.ProbeAsync().ConfigureAwait(false);
+            return new ChromecastDeviceInfo
             {
                 DeviceId = c.DeviceId,
                 Name = c.ReceiverName,
                 DisplayName = c.DisplayName,
                 Model = c.Model,
                 Address = c.Host,
-                IsOnline = c.IsOnline,
+                IsOnline = online,
                 IsHidden = c.IsHidden,
-                IsReceiverOpen = c.IsReceiverOpen,
-                NowPlaying = c.NowPlaying
-            })
-            .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase));
+                IsReceiverOpen = online && c.IsReceiverOpen,
+                NowPlaying = online ? c.NowPlaying : null
+            };
+        })).ConfigureAwait(false);
+
+        return Ok(devices.OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase));
     }
 
     /// <summary>

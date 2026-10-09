@@ -802,6 +802,49 @@ All verified on the 12.2.0 test server against Eettafel TV.
 - **Upstream receiver**: latest tag is still v1.3.1 (2026-09-20), which lacks the external
   subtitle fix `6be49ae`, so `UseUnstableReceiver` stays on by default.
 
+### RESOLVED (2026-10-09, after 0.1.5.0): stale "online" state, lost first connect, details screen, transfer
+
+The user's test report on 0.1.5.0 (subtitle sync after seek, quiet logs, test/hide/rename all
+confirmed working) plus four problems:
+
+- **An unplugged Chromecast stayed "online"** in the settings list and cast menu, inconsistently.
+  Nothing was wrong with renamed devices as such; the list simply showed discovery's view, which
+  only changed after the 120 s stale timeout plus up to 60 s of sweep interval, and a device with
+  the receiver "open" was exempt altogether. Now: `GET /Chromecast/Devices` probes every device's
+  cast port live (2 s, in parallel), so the list is right when it is opened; each discovery scan
+  probes devices it did not see and drops one after two silent scans in a row (~1 minute,
+  `CheckUnseenDevicesAsync`); `OnUnreachable` also discards the dead connection.
+- **No ready screen on the first connect after the Chromecast was restarted.** The plugin still
+  believed the receiver was open (`_appTransportId` set, connection dead), so
+  `OnRemoteControlStartedAsync` returned early; the next command went into a dead TCP connection,
+  where a send does not fail - it vanishes. Three guards: `EnsureAliveAsync` (a status request with
+  a 2.5 s timeout) runs before connect-open, DisplayContent, PlayNow and Test, and also clears
+  `_appTransportId` when the connection is fine but the receiver is no longer in the device's app
+  list; the keep-alive tick has a 4 s timeout and declares the connection lost after two silent
+  ticks (SharpCaster requests never time out by themselves); `HandleConnectionLost` centralizes the
+  cleanup. Verified by closing the receiver from outside with a standalone CastV2 script (the
+  plugin logged the disconnect at once, the device list showed "online, receiver closed", the next
+  DisplayContent relaunched). **Not verified: real power loss** - that needs the user to unplug.
+  Testing note: on this Mac only Apple-signed binaries reach LAN devices; `/usr/bin/python3` works
+  for such scripts, Homebrew's Python gets "No route to host".
+- **The TV stayed on the last item's details while browsing.** Leaving an item page is invisible:
+  the client sends nothing to the target, and going back to the home screen made no HTTP requests
+  at all (cached view; checked with request logging), so observing requests would not work either.
+  The receiver now gets `Identify` (ready screen) from the keep-alive tick once details have been
+  up for 30 s (`DetailsScreenTime`) with nothing loaded. Verified: details at :31, ready at :05.
+- **A cast transferred from the app's player stopped when the player was closed.** jellyfin-web
+  keeps its player page open as the remote control after a transfer and sends `Stop` when that
+  page is hidden (`apps/legacy/controllers/playback/video/index.js`, `onViewHideStopPlayback`) -
+  byte-for-byte the same as a deliberate Stop. A transfer is recognized as a PlayNow with a start
+  position for an item that the same user is playing, or stopped playing within 15 s, in a
+  non-Chromecast session (`IsTransferFromLocalPlayer`; `RemoteControlListener` records
+  `ISessionManager.PlaybackStopped`). After one, the first Stop is ignored (`_ignoreNextStop`);
+  the guard is dropped by a DisplayContent (the user navigated, so the player page is closed), a
+  playback stop reported by the receiver, or connection loss. Verified by replaying the web
+  client's calls: transfer recognized, first Stop ignored and playback continued, second Stop
+  stopped it. Not yet confirmed with the real iOS app.
+- `VerboseGatedLogger` no longer promotes Trace (every heartbeat and raw frame); only Debug.
+
 ### Investigated, fixed by server config (not this plugin): subtitles drift after seeking
 
 Reported: subtitles are in sync when playback just runs, but lag after seeking. Reproduced
@@ -840,9 +883,10 @@ the unstable default.
   jellyfin-chromecast `6be49ae` (latest tag checked 2026-10-09: v1.3.1, without it).
   `UseUnstableReceiver` therefore defaults to **true** (a saved `false` from an older install is
   kept). Once upstream tags that fix, consider switching the default back to stable.
-- **Not yet verified by eye**: the ready screen appearing on connect, the settings page's look,
-  and subtitle sync after seeking on the TV. Also untested: the wrong-guess correction with two
-  Chromecasts in use, the iOS app itself (same web client), and Jellyfin 12.1.
+- **Still to be confirmed by the user on real use**: an unplugged Chromecast leaving the menu
+  within about a minute and the first connect after it restarts; the transfer-then-close-player
+  case in the iOS app; the wrong-guess correction with two Chromecasts in use. Jellyfin 12.1 is
+  untested (12.0 and 12.2 are).
 - The first cast after connecting pays the receiver's ~8 s bandwidth test if the connect guess
   didn't already open it. Passing `maxBitrate` in the envelope would skip it at the cost of the
   automatic measurement.

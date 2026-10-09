@@ -7,8 +7,8 @@ namespace Jellyfin.Plugin.Chromecast;
 /// Ties log output to the plugin's "Verbose logging" setting, read on every call so it applies
 /// without a restart. With verbose off, Debug/Trace are dropped - and so is routine Information
 /// when <c>routineInfoIsVerbose</c> is set (SharpCaster's locator logs several Information lines
-/// per discovery scan, i.e. every 30 seconds forever). With verbose on, Debug/Trace are written at
-/// Information so they show up without editing Jellyfin's logging configuration.
+/// per discovery scan, i.e. every 30 seconds forever). With verbose on, Debug is written at Information
+/// so it shows up without editing Jellyfin's logging configuration; Trace never is.
 /// </summary>
 /// <typeparam name="T">The log category.</typeparam>
 internal sealed class VerboseGatedLogger<T> : ILogger<T>
@@ -33,7 +33,10 @@ internal sealed class VerboseGatedLogger<T> : ILogger<T>
         {
             >= LogLevel.Warning => _inner.IsEnabled(logLevel),
             LogLevel.Information => (!_routineInfoIsVerbose || Verbose) && _inner.IsEnabled(logLevel),
-            _ => Verbose
+            LogLevel.Debug => Verbose,
+
+            // Trace is every heartbeat and every raw frame, several lines a second - never promoted.
+            _ => false
         };
 
     public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)

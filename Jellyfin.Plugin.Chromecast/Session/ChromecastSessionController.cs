@@ -116,6 +116,23 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
     private Guid _lastControllingUserId;
 
+    private int _missedKeepAlives;
+
+    /// <summary>How long mirrored item details stay on the TV before it returns to the ready screen.</summary>
+    private static readonly TimeSpan DetailsScreenTime = TimeSpan.FromSeconds(30);
+
+    private volatile bool _showingDetails;
+
+    private DateTime _detailsShownAt;
+
+    /// <summary>
+    /// Set when playback was transferred here from a player in a Jellyfin app. jellyfin-web keeps
+    /// its player page open as the remote control after a transfer and sends Stop when that page
+    /// is closed (video/index.js onViewHideStopPlayback) - indistinguishable from a deliberate
+    /// Stop, so the first Stop after a transfer is taken to be that and ignored.
+    /// </summary>
+    private volatile bool _ignoreNextStop;
+
     /// <summary>
     /// Guards the three fields below. The receiver handles each PlayNow independently and awaits
     /// its own PlaybackInfo call before loading, so when two arrive close together the one whose
@@ -311,6 +328,9 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         _appTransportId = null;
         StopAppKeepAlive();
         ForgetPlayRequests();
+        _showingDetails = false;
+        _ignoreNextStop = false;
+        Interlocked.Exchange(ref _missedKeepAlives, 0);
     }
 
     /// <summary>
@@ -364,6 +384,114 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         _appKeepAliveTimer = new Timer(_ => AppKeepAliveTick(client, transportId), null, interval, interval);
     }
 
+    private static async Task PingAsync(ChromecastClient client, string transportId)
+    {
+        await client.ConnectionChannel.ConnectAsync(transportId).ConfigureAwait(false);
+        await client.ReceiverChannel.GetChromecastStatusAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Forgets a connection that turned out to be dead (device unplugged or rebooted), so the
+    /// next command reconnects and relaunches instead of talking to a socket nobody reads.
+    /// </summary>
+    private void HandleConnectionLost(ChromecastClient client, string reason)
+    {
+        if (!ReferenceEquals(_client, client))
+        {
+            return;
+        }
+
+        _logger.LogInformation("Lost the connection to Chromecast {Name}: {Reason}", _receiver.Name, reason);
+        client.Disconnected -= OnClientDisconnected;
+        InvalidateConnection();
+        _ = RevokeAccessTokenAsync();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await client.DisconnectAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Error closing the dead connection to {Name}", _receiver.Name);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Checks that a cached connection still answers before it is relied on. A send into a dead
+    /// TCP connection does not fail - it just vanishes - so without this the first command after
+    /// the Chromecast was restarted was silently lost.
+    /// </summary>
+    private async Task EnsureAliveAsync()
+    {
+        var client = _client;
+        if (client is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var status = client.ReceiverChannel.GetChromecastStatusAsync();
+            if (await Task.WhenAny(status, Task.Delay(TimeSpan.FromSeconds(2.5))).ConfigureAwait(false) == status)
+            {
+                // The connection is fine, but the receiver may have been closed behind our back
+                // (another app was cast to the device, or it restarted and we reconnected).
+                var current = await status.ConfigureAwait(false);
+                if (_appTransportId is { } transportId && current?.Applications?.Any(a => a.TransportId == transportId) != true)
+                {
+                    _logger.LogInformation("The Jellyfin receiver on {Name} is no longer running", _receiver.Name);
+                    _appTransportId = null;
+                    StopAppKeepAlive();
+                    ForgetPlayRequests();
+                    _showingDetails = false;
+                    _ignoreNextStop = false;
+                }
+
+                return;
+            }
+
+            HandleConnectionLost(client, "no answer to a status request");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Status request to {Name} failed", _receiver.Name);
+            HandleConnectionLost(client, "a status request failed");
+        }
+    }
+
+    /// <summary>
+    /// Tries a direct connection to the Chromecast's cast port.
+    /// </summary>
+    /// <returns>Whether the device answered within two seconds.</returns>
+    public async Task<bool> ProbeAsync()
+    {
+        try
+        {
+            using var tcp = new System.Net.Sockets.TcpClient();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await tcp.ConnectAsync(Host, Port, timeout.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Marks this Chromecast as gone (it answers neither discovery nor a direct connection).
+    /// </summary>
+    public void OnUnreachable()
+    {
+        MarkStale();
+        if (_client is { } client)
+        {
+            HandleConnectionLost(client, "the device is unreachable");
+        }
+    }
+
     private async void AppKeepAliveTick(ChromecastClient client, string transportId)
     {
         try
@@ -375,11 +503,32 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             // RECEIVER_STATUS request on "receiver-0", which is what a normal Chrome/Android
             // sender periodically does anyway, is the traffic pattern the platform actually
             // watches for.
-            await client.ConnectionChannel.ConnectAsync(transportId).ConfigureAwait(false);
-            await client.ReceiverChannel.GetChromecastStatusAsync().ConfigureAwait(false);
+            // SharpCaster requests have no timeout: against a device that was unplugged or
+            // rebooted they simply never complete. Two silent ticks in a row means it is gone.
+            var ping = PingAsync(client, transportId);
+            if (await Task.WhenAny(ping, Task.Delay(TimeSpan.FromSeconds(4))).ConfigureAwait(false) != ping)
+            {
+                if (Interlocked.Increment(ref _missedKeepAlives) >= 2)
+                {
+                    HandleConnectionLost(client, "it stopped answering");
+                }
+
+                return;
+            }
+
+            await ping.ConfigureAwait(false);
+            Interlocked.Exchange(ref _missedKeepAlives, 0);
 
             // Lets a waiting play request through if the receiver never reported the previous one.
             OnReceiverReported(string.Empty, Guid.Empty);
+
+            // Clients don't say when an item page is left, so the mirrored details would stay
+            // on the TV indefinitely; go back to the ready screen after a while instead.
+            if (_showingDetails && !_receiverHasItem && DateTime.UtcNow - _detailsShownAt > DetailsScreenTime)
+            {
+                _showingDetails = false;
+                await SendReceiverCommandAsync("Identify", null).ConfigureAwait(false);
+            }
 
             // Clients send nothing when they disconnect from a cast target, and this keep-alive
             // would otherwise hold an idle Jellyfin screen on the TV forever.
@@ -485,6 +634,25 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }
     }
 
+    /// <summary>
+    /// Whether this cast continues something the same user was just watching in a Jellyfin app's
+    /// own player (the "cast" button inside the player), as opposed to starting it from a page.
+    /// </summary>
+    private bool IsTransferFromLocalPlayer(PlayRequest command, List<BaseItemDto> items)
+    {
+        if (command.ControllingUserId == Guid.Empty || (command.StartPositionTicks ?? 0) <= 0)
+        {
+            return false;
+        }
+
+        var itemId = items[command.StartIndex is { } start && start > 0 && start < items.Count ? start : 0].Id;
+        var playingLocally = _sessionManager.Sessions.Any(s =>
+            s.UserId.Equals(command.ControllingUserId)
+            && s.NowPlayingItem?.Id == itemId
+            && !string.Equals(s.Client, "Chromecast", StringComparison.Ordinal));
+        return playingLocally || RemoteControlListener.WasJustPlayedLocally(command.ControllingUserId, itemId);
+    }
+
     private void ForgetPlayRequests()
     {
         lock (_playLock)
@@ -496,6 +664,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
     private async Task<bool> SendPlayNowAsync(PlayRequest command, List<BaseItemDto> items, User? user, CancellationToken cancellationToken)
     {
+        await EnsureAliveAsync().ConfigureAwait(false);
         var client = await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
         if (client is null || _connectSdkChannel is null)
         {
@@ -530,6 +699,13 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
         var options = BuildPlayNowOptions(items, command);
         await _connectSdkChannel.SendCommandAsync("PlayNow", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, options, transportId).ConfigureAwait(false);
+        _showingDetails = false;
+        _ignoreNextStop = IsTransferFromLocalPlayer(command, items);
+        if (_ignoreNextStop)
+        {
+            _logger.LogInformation("Playback of {ItemName} was transferred to {DeviceName} from a player in the app", items[0].Name, _receiver.Name);
+        }
+
         return true;
     }
 
@@ -663,6 +839,13 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
                     // The receiver returns to its "ready" screen on its own. It stays open (and the
                     // token stays valid - its backdrop rotation still uses it) until the client
                     // disconnects; see OnRemoteControlEndedAsync.
+                    if (_ignoreNextStop)
+                    {
+                        _ignoreNextStop = false;
+                        _logger.LogInformation("Ignoring the Stop the app sends when its player page closes after transferring playback to {Name}", _receiver.Name);
+                        break;
+                    }
+
                     ForgetPlayRequests();
                     await SendReceiverCommandAsync("Stop", null).ConfigureAwait(false);
                     break;
@@ -755,7 +938,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     /// <returns>A task that completes once the receiver is open, or the attempt failed.</returns>
     public async Task OnRemoteControlStartedAsync(Guid userId)
     {
-        if (_disposed || _appTransportId is not null)
+        if (_disposed)
         {
             return;
         }
@@ -765,6 +948,13 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
         try
         {
+            await EnsureAliveAsync().ConfigureAwait(false);
+            if (_appTransportId is not null)
+            {
+                // Already open and answering - leave whatever it is showing alone.
+                return;
+            }
+
             var client = await EnsureConnectedAsync(CancellationToken.None).ConfigureAwait(false);
             if (client is null || _connectSdkChannel is null)
             {
@@ -813,6 +1003,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
         try
         {
+            await EnsureAliveAsync().ConfigureAwait(false);
             if (IsReceiverOpen)
             {
                 await SendReceiverCommandAsync("Identify", null).ConfigureAwait(false);
@@ -1091,6 +1282,11 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
         try
         {
+            // The user navigated, so the app's player page (if it was open) is closed: any Stop
+            // from here on is deliberate.
+            _ignoreNextStop = false;
+
+            await EnsureAliveAsync().ConfigureAwait(false);
             var client = await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
             if (client is null || _connectSdkChannel is null)
             {
@@ -1112,6 +1308,8 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
             // The receiver ignores this while it's playing something, so it's safe to forward always.
             await _connectSdkChannel.SendCommandAsync("DisplayContent", controllingUser.Id, accessToken, _serverAddress, _receiver.Name, new DisplayContentOptions { ItemId = itemId }, transportId).ConfigureAwait(false);
+            _detailsShownAt = DateTime.UtcNow;
+            _showingDetails = true;
         }
         catch (Exception ex)
         {
@@ -1267,6 +1465,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         if (status.Type == "playbackstop")
         {
             _receiverHasItem = false;
+            _ignoreNextStop = false;
         }
 
         var reportedItemId = Guid.Empty;
@@ -1390,10 +1589,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         _logger.LogInformation("Chromecast {Name} disconnected", _receiver.Name);
 
         var client = _client;
-        _client = null;
-        _connectSdkChannel = null;
-        _appTransportId = null;
-        StopAppKeepAlive();
+        InvalidateConnection();
 
         if (client is not null)
         {

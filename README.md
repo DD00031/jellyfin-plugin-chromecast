@@ -55,11 +55,16 @@ app already has. Pick one, press Play, and it plays on the TV.
 1. **Connect:** tap the cast icon and pick your Chromecast. The TV switches to Jellyfin's ready
    screen. With more than one Chromecast, the plugin opens the one you used last (see
    [Good to know](#good-to-know)).
-2. **Browse:** open a movie or episode and the TV shows its details.
+2. **Browse:** open a movie or episode and the TV shows its details. After half a minute it goes
+   back to the ready screen (Jellyfin apps don't tell the server when you leave a page).
 3. **Play:** press Play. Pick the audio and subtitle track on the item's page first, or change them
    while it plays.
 4. **Stop:** the TV goes back to the ready screen, ready for the next thing.
 5. **Disconnect:** tap the cast icon and choose Disconnect. Jellyfin closes on the TV.
+
+You can also start watching on your phone and move it to the TV: tap the cast icon inside the
+player and pick a Chromecast. It continues where you were, and keeps playing when you close the
+player on the phone.
 
 ## Settings
 
@@ -97,7 +102,8 @@ show Jellyfin's ready screen on it for a few seconds.
   can't be removed by a plugin. Casting works regardless.
 - **A Chromecast is missing from the menu.** The server and the Chromecast must be on the same
   network, and the server must not be behind a VPN that hides local devices. A Chromecast powered
-  from the TV's USB port is off when the TV is off.
+  from the TV's USB port is off when the TV is off. One that is switched off leaves the menu after
+  about a minute and comes back within half a minute of being switched on.
 - **After updating Jellyfin**, the plugin normally keeps working. This repository checks itself
   against every new Jellyfin release daily and opens an issue if a release breaks it.
 
