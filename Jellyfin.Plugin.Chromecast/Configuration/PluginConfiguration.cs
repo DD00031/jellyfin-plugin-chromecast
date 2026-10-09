@@ -18,6 +18,7 @@ public class PluginConfiguration : BasePluginConfiguration
         UseUnstableReceiver = true;
         OpenReceiverOnConnect = true;
         LastCastTargets = [];
+        DeviceSettings = [];
         EnableDebugLogging = false;
     }
 
@@ -62,6 +63,11 @@ public class PluginConfiguration : BasePluginConfiguration
     public LastCastTarget[] LastCastTargets { get; set; }
 
     /// <summary>
+    /// Gets or sets per-Chromecast choices made in the settings page (custom name, hidden).
+    /// </summary>
+    public ChromecastDeviceSettings[] DeviceSettings { get; set; }
+
+    /// <summary>
     /// Gets or sets a value indicating whether routine discovery output and CastV2 protocol
     /// detail are written to the server log (see <c>VerboseGatedLogger</c>).
     /// </summary>
@@ -82,4 +88,25 @@ public class LastCastTarget
     /// Gets or sets the Chromecast session's device id.
     /// </summary>
     public string DeviceId { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// An admin's choices for one Chromecast.
+/// </summary>
+public class ChromecastDeviceSettings
+{
+    /// <summary>
+    /// Gets or sets the Chromecast session's device id.
+    /// </summary>
+    public string DeviceId { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the name to show in Jellyfin instead of the Chromecast's own; empty for none.
+    /// </summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether this Chromecast is left out of the cast menu.
+    /// </summary>
+    public bool Hidden { get; set; }
 }

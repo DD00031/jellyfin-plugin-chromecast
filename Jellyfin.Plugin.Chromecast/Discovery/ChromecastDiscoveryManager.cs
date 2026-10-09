@@ -82,6 +82,11 @@ public sealed class ChromecastDiscoveryManager : IDisposable
         // on a "device found" event that only fires once per device for the locator's lifetime)
         // so that liveness is refreshed for devices we already know about too, not just newly
         // seen ones.
+        if (Plugin.Instance is not null)
+        {
+            Plugin.Instance.ConfigurationChanged += OnConfigurationChanged;
+        }
+
         _ = Task.Run(() => RunDiscoveryLoopAsync(interval, _loopCts.Token));
     }
 
@@ -117,6 +122,38 @@ public sealed class ChromecastDiscoveryManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// The name a Chromecast is shown under in Jellyfin: the admin's custom name if one is set in
+    /// the plugin settings, otherwise the optional prefix plus the Chromecast's own name.
+    /// </summary>
+    private static string GetDisplayName(string receiverName, string deviceId)
+    {
+        var config = GetConfig();
+        var custom = (config.DeviceSettings ?? [])
+            .FirstOrDefault(d => string.Equals(d.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase))?.Name;
+        if (!string.IsNullOrWhiteSpace(custom))
+        {
+            return custom.Trim();
+        }
+
+        return string.IsNullOrEmpty(config.DeviceNamePrefix) ? receiverName : config.DeviceNamePrefix + receiverName;
+    }
+
+    /// <summary>
+    /// Applies renamed Chromecasts right after the settings are saved, instead of on the next scan.
+    /// </summary>
+    private void OnConfigurationChanged(object? sender, MediaBrowser.Model.Plugins.BasePluginConfiguration e)
+    {
+        foreach (var session in _sessionManager.Sessions)
+        {
+            var controller = session.SessionControllers.OfType<ChromecastSessionController>().FirstOrDefault();
+            if (controller is not null)
+            {
+                session.DeviceName = GetDisplayName(controller.ReceiverName, session.DeviceId);
+            }
+        }
+    }
+
     private static PluginConfiguration GetConfig() => Plugin.Instance?.Configuration ?? new PluginConfiguration();
 
     private async Task ProcessReceiverAsync(ChromecastReceiver receiver)
@@ -144,6 +181,7 @@ public sealed class ChromecastDiscoveryManager : IDisposable
                 // Already tracked - just refresh the receiver info in case the IP changed, and
                 // clear any stale flag now that it has responded again.
                 controller.UpdateReceiver(receiver);
+                existing!.DeviceName = GetDisplayName(receiver.Name, deviceId);
                 return;
             }
 
@@ -161,8 +199,7 @@ public sealed class ChromecastDiscoveryManager : IDisposable
 
     private async Task AddDeviceAsync(ChromecastReceiver receiver, string deviceId)
     {
-        var config = GetConfig();
-        var deviceName = string.IsNullOrEmpty(config.DeviceNamePrefix) ? receiver.Name : config.DeviceNamePrefix + receiver.Name;
+        var deviceName = GetDisplayName(receiver.Name, deviceId);
 
         var sessionInfo = await _sessionManager
             .LogSessionActivity("Chromecast", _appHost.ApplicationVersionString, deviceId, deviceName, receiver.DeviceUri.Host, null)
@@ -282,6 +319,11 @@ public sealed class ChromecastDiscoveryManager : IDisposable
         }
 
         _disposed = true;
+        if (Plugin.Instance is not null)
+        {
+            Plugin.Instance.ConfigurationChanged -= OnConfigurationChanged;
+        }
+
         _loopCts.Cancel();
         _loopCts.Dispose();
         _locator.Dispose();

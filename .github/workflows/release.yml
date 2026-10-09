@@ -1,16 +1,18 @@
 name: Release
 
-# Run from GitHub: Actions -> Release -> Run workflow. Builds the plugin against the exact
-# Jellyfin server version you enter (plugin builds only load on the server version they were
-# built for), bumps the plugin version, and publishes a release plus manifest.json entry so
-# servers using this repository see the update.
+# Run from GitHub: Actions -> Release -> Run workflow. Builds the plugin against the Jellyfin
+# version you enter, bumps the plugin version, and publishes a release plus manifest.json entry so
+# servers using this repository see the update. A build works on the Jellyfin version it was
+# built against and on newer ones (unless a server API it uses changed), and servers older than
+# that version are not offered it - so build against the oldest version you want to support.
 
 on:
   workflow_dispatch:
     inputs:
       jellyfin_version:
-        description: "Your Jellyfin server version, exactly (e.g. 12.0.1)"
+        description: "Jellyfin version to build against - the oldest one to support (12.0.0 covers every 12.x)"
         required: true
+        default: "12.0.0"
       plugin_version:
         description: "Plugin version (e.g. 0.1.4.0) - leave empty to bump the last number"
         required: false

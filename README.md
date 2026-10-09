@@ -1,4 +1,8 @@
-# Jellyfin Chromecast Plugin
+<p align="center">
+  <img src="assets/banner.jpg" alt="Chromecast for Jellyfin" width="720">
+</p>
+
+# Chromecast for Jellyfin
 
 Cast from **any** Jellyfin app to a Chromecast, including the iPhone, iPad and Mac apps.
 
@@ -26,11 +30,11 @@ app already has. Pick one, press Play, and it plays on the TV.
 - Subtitles work, including `.srt` files that sit next to the video.
 - The TV shows Jellyfin's "ready" screen when you connect, mirrors the movie page you're looking
   at, and goes back to its normal screen when you disconnect.
+- If a cast can't start, the app tells you why instead of doing nothing.
 
 ## What you need
 
-- Jellyfin server **12.0**. Each plugin release is built for one exact server version; the current
-  one is for 12.0.0.
+- Jellyfin server **12.0 or newer** (tested on 12.0 and 12.2).
 - A Chromecast or other Google Cast device on the **same local network** as the Jellyfin server.
 
 ## Quick start
@@ -61,6 +65,10 @@ app already has. Pick one, press Play, and it plays on the TV.
 
 **Dashboard → Plugins → Chromecast.** The defaults are fine for most people.
 
+At the top is the list of **Chromecasts** the server has found, each with its status. There you
+can give one a different name for the cast menu, hide one you never cast to, and press **Test** to
+show Jellyfin's ready screen on it for a few seconds.
+
 | Setting | What it does |
 |---|---|
 | Discovery interval | How often the server looks for Chromecasts. Default: every 30 seconds. |
@@ -90,8 +98,8 @@ app already has. Pick one, press Play, and it plays on the TV.
 - **A Chromecast is missing from the menu.** The server and the Chromecast must be on the same
   network, and the server must not be behind a VPN that hides local devices. A Chromecast powered
   from the TV's USB port is off when the TV is off.
-- **After updating Jellyfin**, the plugin needs a build for the new server version. See
-  [Releasing](#releasing).
+- **After updating Jellyfin**, the plugin normally keeps working. This repository checks itself
+  against every new Jellyfin release daily and opens an issue if a release breaks it.
 
 ## Reporting a problem
 
@@ -128,15 +136,19 @@ handling - see [CLAUDE.md](CLAUDE.md) for why.
 dotnet build Jellyfin.Plugin.Chromecast/Jellyfin.Plugin.Chromecast.csproj
 ```
 
-Requires the .NET 10 SDK. A build only loads on the exact Jellyfin version it was built against;
-pass `-p:JellyfinServerVersion=<version>` to target another one.
+Requires the .NET 10 SDK. Builds target the oldest supported Jellyfin (12.0.0) so one release
+serves every newer server too; pass `-p:JellyfinServerVersion=<version>` to compile against
+another one.
 
 ## Releasing
 
-Releases are cut by the **Release** workflow: **Actions → Release → Run workflow**, enter the exact
-Jellyfin server version to build for, and optionally a plugin version and changelog. It bumps every
-version file, builds, checks the result, publishes the GitHub release and adds it to
-`manifest.json`, so servers using this repository see the update.
+Releases are cut by the **Release** workflow: **Actions → Release → Run workflow**, enter the
+Jellyfin version to build against (normally `12.0.0`, the oldest supported), and optionally a
+plugin version and changelog. It bumps every version file, builds, checks the result, publishes
+the GitHub release and adds it to `manifest.json`, so servers using this repository see the update.
+
+The **Jellyfin compatibility check** workflow compiles the plugin against the newest Jellyfin
+release every day and opens an issue if that stops working.
 
 ## License
 

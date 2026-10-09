@@ -14,6 +14,19 @@
                         <p><strong>Each cast uses Jellyfin sessions of the user who started it</strong> (the Chromecast signs in to Jellyfin as that user). If a user has a limit under Dashboard &rarr; Users &rarr; (user) &rarr; <em>Max number of simultaneous user sessions</em>, set it to 0 (unlimited), or leave room for 2 extra sessions per Chromecast on top of the devices that user is signed in on. Otherwise casting fails for that user.</p>
                     </div>
 
+                    <div class="verticalSection">
+                        <h3>Chromecasts</h3>
+                        <div class="fieldDescription" style="margin-bottom:1em;">The devices found on your network since the server started. Give one a different name for the cast menu, hide it from the menu, or press Test to show Jellyfin's ready screen on it for a few seconds.</div>
+                        <div id="ChromecastDeviceList"></div>
+                        <button is="emby-button" type="button" id="ChromecastRefreshDevices" class="raised emby-button" style="margin-top:.5em;">
+                            <span>Refresh list</span>
+                        </button>
+                    </div>
+
+                    <div class="verticalSection">
+                        <h3>Settings</h3>
+                    </div>
+
                     <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="DiscoveryIntervalSeconds">Discovery interval (seconds)</label>
                         <input id="DiscoveryIntervalSeconds" name="DiscoveryIntervalSeconds" type="number" is="emby-input" min="5" required />
@@ -70,6 +83,125 @@
             (function () {
                 const pluginId = '06afff54-6a74-4e08-9d50-9fa63803c73d';
 
+                function deviceSettingsFor(config, deviceId) {
+                    return (config.DeviceSettings || []).filter(function (d) {
+                        return d.DeviceId === deviceId;
+                    })[0] || { DeviceId: deviceId, Name: '', Hidden: false };
+                }
+
+                function el(tag, text, style) {
+                    const node = document.createElement(tag);
+                    if (text) {
+                        node.textContent = text;
+                    }
+                    if (style) {
+                        node.setAttribute('style', style);
+                    }
+                    return node;
+                }
+
+                function renderDevices(page, config, devices) {
+                    const list = page.querySelector('#ChromecastDeviceList');
+                    list.textContent = '';
+
+                    if (!devices.length) {
+                        list.appendChild(el('div', 'No Chromecasts found yet. They appear within about half a minute of the server starting, if they are switched on and on the same network as the server.', 'opacity:.8;'));
+                        return;
+                    }
+
+                    devices.forEach(function (device) {
+                        const settings = deviceSettingsFor(config, device.DeviceId);
+                        const row = el('div', null, 'border:1px solid rgba(128,128,128,.35);border-radius:6px;padding:.8em 1em;margin-bottom:.8em;');
+                        row.className = 'chromecastDeviceRow';
+                        row.dataset.deviceId = device.DeviceId;
+
+                        const header = el('div', null, 'display:flex;align-items:center;gap:.6em;flex-wrap:wrap;');
+                        header.appendChild(el('span', '\u25CF', 'color:' + (device.IsOnline ? '#4caf50' : '#9e9e9e') + ';'));
+                        header.appendChild(el('strong', device.Name));
+
+                        let status = device.IsOnline ? 'Online' : 'Not seen recently';
+                        if (device.NowPlaying) {
+                            status = 'Playing: ' + device.NowPlaying;
+                        } else if (device.IsReceiverOpen) {
+                            status = 'Jellyfin is open';
+                        }
+                        header.appendChild(el('span', status + ' \u00B7 ' + device.Model + ' \u00B7 ' + device.Address, 'opacity:.7;font-size:.9em;'));
+                        row.appendChild(header);
+
+                        const controls = el('div', null, 'display:flex;align-items:center;gap:1em;flex-wrap:wrap;margin-top:.6em;');
+
+                        const name = el('input', null, 'flex:1;min-width:12em;padding:.4em .6em;');
+                        name.type = 'text';
+                        name.className = 'chromecastDeviceName emby-input';
+                        name.placeholder = 'Name in the cast menu (default: ' + device.Name + ')';
+                        name.value = settings.Name || '';
+                        controls.appendChild(name);
+
+                        const hideLabel = el('label', null, 'display:flex;align-items:center;gap:.4em;white-space:nowrap;');
+                        const hide = el('input');
+                        hide.type = 'checkbox';
+                        hide.className = 'chromecastDeviceHidden';
+                        hide.checked = !!settings.Hidden;
+                        hideLabel.appendChild(hide);
+                        hideLabel.appendChild(el('span', 'Hide from the cast menu'));
+                        controls.appendChild(hideLabel);
+
+                        const test = el('button', 'Test');
+                        test.type = 'button';
+                        test.className = 'raised emby-button';
+                        test.disabled = !device.IsOnline;
+                        const result = el('span', null, 'font-size:.9em;');
+                        test.addEventListener('click', function () {
+                            test.disabled = true;
+                            result.textContent = 'Asking the Chromecast...';
+                            ApiClient.ajax({
+                                type: 'POST',
+                                url: ApiClient.getUrl('Chromecast/Devices/' + encodeURIComponent(device.DeviceId) + '/Test')
+                            }).then(function () {
+                                result.textContent = 'It responded - Jellyfin\'s ready screen should be on the TV for about 15 seconds.';
+                            }, function () {
+                                result.textContent = 'No response. Check that it is switched on and on the same network as the server.';
+                            }).then(function () {
+                                test.disabled = false;
+                            });
+                        });
+                        controls.appendChild(test);
+                        controls.appendChild(result);
+
+                        row.appendChild(controls);
+                        list.appendChild(row);
+                    });
+                }
+
+                function loadDevices(page, config) {
+                    return ApiClient.getJSON(ApiClient.getUrl('Chromecast/Devices')).then(function (devices) {
+                        renderDevices(page, config, devices);
+                    }, function () {
+                        page.querySelector('#ChromecastDeviceList').textContent = 'Could not load the list of Chromecasts.';
+                    });
+                }
+
+                function collectDeviceSettings(page, config) {
+                    // Keep choices for Chromecasts that aren't listed right now (switched off, say).
+                    const listed = {};
+                    const result = [];
+                    page.querySelectorAll('.chromecastDeviceRow').forEach(function (row) {
+                        const deviceId = row.dataset.deviceId;
+                        listed[deviceId] = true;
+                        const name = row.querySelector('.chromecastDeviceName').value.trim();
+                        const hidden = row.querySelector('.chromecastDeviceHidden').checked;
+                        if (name || hidden) {
+                            result.push({ DeviceId: deviceId, Name: name, Hidden: hidden });
+                        }
+                    });
+                    (config.DeviceSettings || []).forEach(function (d) {
+                        if (!listed[d.DeviceId]) {
+                            result.push(d);
+                        }
+                    });
+                    return result;
+                }
+
                 function loadConfig(page) {
                     Dashboard.showLoadingMsg();
                     ApiClient.getPluginConfiguration(pluginId).then(function (config) {
@@ -79,7 +211,9 @@
                         page.querySelector('#UseUnstableReceiver').checked = config.UseUnstableReceiver;
                         page.querySelector('#OpenReceiverOnConnect').checked = config.OpenReceiverOnConnect;
                         page.querySelector('#EnableDebugLogging').checked = config.EnableDebugLogging;
-                        Dashboard.hideLoadingMsg();
+                        loadDevices(page, config).then(function () {
+                            Dashboard.hideLoadingMsg();
+                        });
                     });
                 }
 
@@ -92,9 +226,11 @@
                         config.UseUnstableReceiver = page.querySelector('#UseUnstableReceiver').checked;
                         config.OpenReceiverOnConnect = page.querySelector('#OpenReceiverOnConnect').checked;
                         config.EnableDebugLogging = page.querySelector('#EnableDebugLogging').checked;
+                        config.DeviceSettings = collectDeviceSettings(page, config);
 
                         ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
                             Dashboard.processPluginConfigurationUpdateResult(result);
+                            loadConfig(page);
                         });
                     });
                 }
@@ -102,6 +238,11 @@
                 document.querySelector('#ChromecastConfigPage')
                     .addEventListener('pageshow', function () {
                         loadConfig(this);
+                    });
+
+                document.querySelector('#ChromecastRefreshDevices')
+                    .addEventListener('click', function () {
+                        loadConfig(this.closest('.page'));
                     });
 
                 document.querySelector('#ChromecastConfigForm')

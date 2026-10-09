@@ -1,0 +1,68 @@
+name: Jellyfin compatibility check
+
+# Once a day, compile the plugin against the newest stable Jellyfin release on NuGet. A build
+# made for an older Jellyfin keeps working on newer ones as long as the server API it uses is
+# unchanged, so there is nothing to publish when this passes. When it fails, a server API the
+# plugin relies on has changed: this opens an issue so that is known before users hit it.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Find the newest stable Jellyfin release
+        id: latest
+        run: |
+          VERSION=$(curl -fsS https://api.nuget.org/v3-flatcontainer/jellyfin.controller/index.json \
+            | python3 -c "import sys, json, re; v = [x for x in json.load(sys.stdin)['versions'] if re.fullmatch(r'\d+\.\d+\.\d+', x)]; print(sorted(v, key=lambda s: [int(p) for p in s.split('.')])[-1])")
+          echo "Newest stable Jellyfin: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build against it
+        id: build
+        continue-on-error: true
+        env:
+          JELLYFIN_VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          set -o pipefail
+          dotnet build -c Release -p:JellyfinServerVersion="$JELLYFIN_VERSION" \
+            Jellyfin.Plugin.Chromecast/Jellyfin.Plugin.Chromecast.csproj 2>&1 | tee build.log
+
+      - name: Open an issue if the build broke
+        if: ${{ steps.build.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JELLYFIN_VERSION: ${{ steps.latest.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="Plugin does not build against Jellyfin $JELLYFIN_VERSION"
+          if [ -n "$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq '.[].number')" ]; then
+            echo "An issue for this is already open."
+          else
+            {
+              echo "The daily compatibility check could not compile the plugin against Jellyfin $JELLYFIN_VERSION."
+              echo "The current release may not load or work on that version until this is fixed."
+              echo
+              echo "Run: $RUN_URL"
+              echo
+              echo '```'
+              grep -E "error" build.log | sed -E 's|^/home/runner/work/[^/]+/[^/]+/||' | sort -u | head -30
+              echo '```'
+            } > body.md
+            gh issue create --title "$TITLE" --body-file body.md
+          fi
+          exit 1

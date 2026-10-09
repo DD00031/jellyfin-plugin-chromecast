@@ -6,6 +6,7 @@
     "overview": "Cast to Google Cast devices from Jellyfin's built-in cast interface, on every client including iOS/iPadOS/macOS.",
     "owner": "DD00031",
     "category": "General",
+    "imageUrl": "https://raw.githubusercontent.com/DD00031/jellyfin-plugin-chromecast/main/assets/logo.jpg",
     "versions": [
       {
         "version": "0.1.3.0",

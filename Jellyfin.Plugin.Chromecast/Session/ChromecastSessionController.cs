@@ -116,6 +116,8 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
 
     private Guid _lastControllingUserId;
 
+    private DateTime _lastNotification;
+
     /// <summary>The user this receiver was opened for on a connect guess, until a real command confirms it.</summary>
     private Guid _openedOnConnectFor;
 
@@ -158,7 +160,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     }
 
     /// <inheritdoc />
-    public bool IsSessionActive => !_disposed && !_stale;
+    public bool IsSessionActive => !_disposed && !_stale && !IsHidden;
 
     /// <inheritdoc />
     public bool SupportsMediaControl => IsSessionActive;
@@ -269,6 +271,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             // silently instead of ever reaching a log, which is exactly what made an earlier bug
             // in this method look like a silent hang instead of the fault it actually was.
             _logger.LogError(ex, "Error casting to Chromecast {Name}", _receiver.Name);
+            NotifyUser(command.ControllingUserId, $"Casting to {DisplayName} failed. Try again.");
 
             // A failure here (e.g. a write to a dead SslStream because the device closed the
             // connection between casts without us noticing) means the cached client can no
@@ -289,6 +292,42 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         _connectSdkChannel = null;
         _appTransportId = null;
         StopAppKeepAlive();
+    }
+
+    /// <summary>
+    /// Shows a short message in the Jellyfin app of the user who is casting, so a failed cast
+    /// doesn't just look like nothing happened. The command doesn't say which of the user's
+    /// devices sent it, so this goes to the one that was active most recently.
+    /// </summary>
+    private void NotifyUser(Guid userId, string text)
+    {
+        var now = DateTime.UtcNow;
+        if (userId == Guid.Empty || now - _lastNotification < TimeSpan.FromSeconds(10))
+        {
+            return;
+        }
+
+        _lastNotification = now;
+
+        try
+        {
+            var target = _sessionManager.Sessions
+                .Where(s => s.UserId.Equals(userId) && s.IsActive && !s.SessionControllers.OfType<ChromecastSessionController>().Any())
+                .OrderByDescending(s => s.LastActivityDate)
+                .FirstOrDefault();
+            if (target is null)
+            {
+                return;
+            }
+
+            _ = _sessionManager
+                .SendMessageCommand(_session.Id, target.Id, new MessageCommand { Header = "Chromecast", Text = text, TimeoutMs = 8000 }, CancellationToken.None)
+                .ContinueWith(t => _logger.LogDebug(t.Exception, "Could not show a message in the casting app"), CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not show a message in the casting app");
+        }
     }
 
     private void MarkActivity() => Interlocked.Exchange(ref _lastActivityTicks, DateTime.UtcNow.Ticks);
@@ -356,6 +395,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         var client = await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
         if (client is null || _connectSdkChannel is null)
         {
+            NotifyUser(command.ControllingUserId, $"Couldn't reach {DisplayName}. Check that it is switched on and on the same network as the server.");
             return;
         }
 
@@ -373,6 +413,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         var (transportId, launched) = await EnsureReceiverAppAsync(client, cancellationToken).ConfigureAwait(false);
         if (transportId is null)
         {
+            NotifyUser(command.ControllingUserId, $"{DisplayName} didn't open the Jellyfin app. Try again in a moment.");
             return;
         }
 
@@ -551,6 +592,46 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     public string DeviceId => _session.DeviceId;
 
     /// <summary>
+    /// Gets the name this Chromecast is shown under in Jellyfin (custom name, or prefix + own name).
+    /// </summary>
+    public string DisplayName => _session.DeviceName;
+
+    /// <summary>
+    /// Gets the name the Chromecast itself reports.
+    /// </summary>
+    public string ReceiverName => _receiver.Name;
+
+    /// <summary>
+    /// Gets the Chromecast's model name.
+    /// </summary>
+    public string Model => _receiver.Model;
+
+    /// <summary>
+    /// Gets the Chromecast's network address.
+    /// </summary>
+    public string Host => _receiver.DeviceUri.Host;
+
+    /// <summary>
+    /// Gets a value indicating whether the Chromecast answered a recent discovery scan.
+    /// </summary>
+    public bool IsOnline => !_disposed && !_stale;
+
+    /// <summary>
+    /// Gets a value indicating whether the Jellyfin receiver is currently open on the Chromecast.
+    /// </summary>
+    public bool IsReceiverOpen => _appTransportId is not null;
+
+    /// <summary>
+    /// Gets the name of what is playing, if anything.
+    /// </summary>
+    public string? NowPlaying => _session.NowPlayingItem?.Name;
+
+    /// <summary>
+    /// Gets a value indicating whether an admin hid this Chromecast in the plugin settings.
+    /// </summary>
+    public bool IsHidden => (Plugin.Instance?.Configuration.DeviceSettings ?? []).Any(d => d.Hidden && string.Equals(d.DeviceId, DeviceId, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
     /// Called when a Jellyfin client of <paramref name="userId"/> connects to a remote player and
     /// this Chromecast is the best guess for which one (see <see cref="RemoteControlListener"/>).
     /// Opens the receiver's "ready" screen so the TV reacts to the connect itself.
@@ -599,6 +680,69 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         {
             _logger.LogError(ex, "Error opening the ready screen on Chromecast {Name}", _receiver.Name);
             InvalidateConnection();
+        }
+    }
+
+    /// <summary>
+    /// Shows the receiver's "ready" screen so an admin can check from the settings page that this
+    /// Chromecast is reachable. If the receiver had to be opened for it, it closes again shortly
+    /// after unless someone starts using it.
+    /// </summary>
+    /// <returns>Whether the Chromecast responded.</returns>
+    public async Task<bool> TestAsync()
+    {
+        if (_disposed)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (IsReceiverOpen)
+            {
+                await SendReceiverCommandAsync("Identify", null).ConfigureAwait(false);
+                return true;
+            }
+
+            var generation = Interlocked.Increment(ref _castGeneration);
+            MarkActivity();
+
+            var client = await EnsureConnectedAsync(CancellationToken.None).ConfigureAwait(false);
+            if (client is null || _connectSdkChannel is null)
+            {
+                return false;
+            }
+
+            var (accessToken, user) = await GetAccessTokenAsync(null, CancellationToken.None).ConfigureAwait(false);
+            if (accessToken is null || user is null)
+            {
+                return false;
+            }
+
+            var (transportId, _) = await EnsureReceiverAppAsync(client, CancellationToken.None).ConfigureAwait(false);
+            if (transportId is null)
+            {
+                return false;
+            }
+
+            await _connectSdkChannel.SendCommandAsync("Identify", user.Id, accessToken, _serverAddress, _receiver.Name, null, transportId).ConfigureAwait(false);
+            _ = CloseAfterTestAsync(generation);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error testing Chromecast {Name}", _receiver.Name);
+            InvalidateConnection();
+            return false;
+        }
+    }
+
+    private async Task CloseAfterTestAsync(int generation)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        if (generation == Volatile.Read(ref _castGeneration))
+        {
+            await CloseReceiverAppAsync().ConfigureAwait(false);
         }
     }
 
@@ -894,7 +1038,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
                 DeviceName = _receiver.Name
             }).ConfigureAwait(false);
         }
-        catch (System.Security.SecurityException ex)
+        catch (MediaBrowser.Controller.Net.SecurityException ex)
         {
             // Most likely "User is at their maximum number of sessions": every cast signs the
             // Chromecast in as the casting user, which counts against that user's session limit.
@@ -903,6 +1047,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
                 _receiver.Name,
                 user.Username,
                 ex.Message);
+            NotifyUser(user.Id, "Casting isn't possible right now: your account has reached its limit of simultaneous sessions. Ask the server admin to raise it.");
             return (null, null);
         }
 
@@ -1022,6 +1167,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
                 case "error":
                 case "connectionerror":
                     _logger.LogWarning("Chromecast receiver reported an error: {Message}", status.Message);
+                    NotifyUser(_lastControllingUserId, $"{DisplayName} couldn't play this.");
                     break;
             }
         }

@@ -16,7 +16,7 @@ Google's Cast Sender SDK) doesn't solve their actual problem.
 Secondary requirement: content that a Chromecast can't decode - specifically H.265/HEVC, which the
 user confirmed 3rd-gen Chromecast hardware chokes on - must get transcoded automatically.
 
-Target: **Jellyfin 12.0 only** (released September 2026). Not maintaining 10.x/11.x compatibility;
+Target: **Jellyfin 12.x** (12.0 was released September 2026; built against 12.0.0, tested through 12.2). Not maintaining 10.x/11.x compatibility;
 12.0's plugin ABI is a breaking change from 10.11.x anyway (EF Core rewrite, .NET 10, `Jellyfin.Api`
 namespace reorg), so there's no realistic way to support both from one build.
 
@@ -204,6 +204,8 @@ Jellyfin.Plugin.Chromecast/
   Cast/
     ConnectSdkChannel.cs                      - custom CastV2 channel for urn:x-cast:com.connectsdk
     ConnectSdkMessages.cs                     - DTOs for the connectsdk message shapes above
+  Api/
+    ChromecastController.cs                   - admin API for the settings page (device list, test)
   Session/
     ChromecastSessionController.cs            - ISessionController: Jellyfin commands -> connectsdk commands,
                                                  connectsdk status -> Jellyfin session state
@@ -741,6 +743,34 @@ Also in this round:
   is on (read per call, no restart), and Debug output is then written at Information so no
   `logging.json` edit is needed. That setting was previously wired to nothing.
 
+### Usability round (2026-10-09): failure messages, device list, hide/rename, branding
+
+- **Failed casts tell the user.** `NotifyUser` sends a toast (`ISessionManager.SendMessageCommand`
+  with `TimeoutMs`, which jellyfin-web shows as a toast rather than a blocking alert) to the
+  casting user's most recently active non-Chromecast session - the command doesn't say which
+  device sent it. Used for: Chromecast unreachable, receiver didn't open, generic cast failure,
+  receiver-reported playback error, and the session limit. Throttled to one per 10 s per
+  Chromecast. The session-limit exception is **`MediaBrowser.Controller.Net.SecurityException`**,
+  not `System.Security.SecurityException` (the first attempt caught the wrong one and fell
+  through to the generic message). Verified in the web app with the user's limit set to 1.
+- **Admin API** (`Api/ChromecastController.cs`, `[Authorize(Policy = Policies.RequiresElevation)]`
+  from `MediaBrowser.Common.Api`): `GET /Chromecast/Devices` and
+  `POST /Chromecast/Devices/{id}/Test`. Test shows the ready screen (`Identify`) and, if the
+  receiver had to be opened for it, closes it after 15 s unless something else used it meanwhile.
+  Controllers are found through `ISessionManager.Sessions`, so no extra DI registration is needed.
+- **Hide / rename** (`PluginConfiguration.DeviceSettings`): a hidden Chromecast keeps its session
+  and controller but `IsSessionActive` is false (read live from the config), so it drops out of
+  every cast menu and still shows in the settings list. A custom name is written to
+  `SessionInfo.DeviceName` on each discovery pass and immediately on `ConfigurationChanged`; the
+  receiver keeps being addressed by its own name.
+- **Settings page** lists the discovered Chromecasts (status, model, address, name field, hide
+  box, Test button), built with `textContent` only, and keeps settings for devices that are not
+  listed at the moment of saving.
+- **Branding**: `assets/logo.jpg` (manifest `imageUrl`, shown in the plugin catalog) and
+  `assets/banner.jpg` (README). Both made by the user.
+
+All verified on the 12.2.0 test server against Eettafel TV.
+
 ### Investigated, fixed by server config (not this plugin): subtitles drift after seeking
 
 Reported: subtitles are in sync when playback just runs, but lag after seeking. Reproduced
@@ -816,15 +846,18 @@ To build against a different server patch version than the default in the `.cspr
 dotnet build -p:JellyfinServerVersion=12.0.1 Jellyfin.Plugin.Chromecast/Jellyfin.Plugin.Chromecast.csproj
 ```
 
-Plugin assemblies are **not** forward/backward compatible across Jellyfin server patch versions -
-a build against 12.0.0 will fail to load with a bare assembly-load error against 12.0.1 and vice
-versa. Always match the exact running server version. (Only 12.0.0 and 12.1.0 exist on NuGet as of
-2026-09-25 - there was no 12.0.1 package.)
+**Version compatibility (corrected 2026-10-09).** An earlier version of this file claimed a build
+only loads on the exact server version it was built against. That was never tested and is wrong:
+a build against 12.0.0 loaded on a 12.2.0 server and cast correctly there (transcode, subtitles,
+seek, stop, no errors). What is true: Jellyfin only offers a release to servers at or above its
+`targetAbi`, and a build can break on a newer server if an API it uses changed. So **build against
+the oldest supported version (12.0.0, the `.csproj` default)** - one release then serves 12.0,
+12.1 and 12.2 - and test on the newest. NuGet has 12.0.0, 12.1.0 and 12.2.0 (no 12.0.x patches).
 
 ## Releasing
 
 Use the **Release** GitHub Actions workflow (`.github/workflows/release.yml`, manual trigger:
-Actions → Release → Run workflow). Inputs: the exact Jellyfin server version to build against,
+Actions → Release → Run workflow). Inputs: the Jellyfin version to build against (default 12.0.0),
 optionally the plugin version (default: bump the last number) and changelog, and a dry-run switch.
 `.github/scripts/release.py` updates every file that carries the version - `Directory.Build.props`
 (the DLL's real version; see the 0.1.1.0 incident), the `.csproj`'s default
@@ -834,6 +867,11 @@ entry (targetAbi = `<jellyfin version>.0`, MD5 checksum), commits as github-acti
 `v<version>` and creates the GitHub release. Verified with a dry run on 2026-09-25 (same 5 DLLs as
 the hand-made releases). For a release with code changes, commit the code first, then run the
 workflow with a real changelog.
+
+`.github/workflows/compatibility.yml` runs daily: it compiles the plugin against the newest stable
+`Jellyfin.Controller` on NuGet and opens an issue (once) if that fails. Nothing is published when
+it passes - the existing release keeps working on the new server. This replaced the idea of
+automatic rebuilds per Jellyfin version, which the compatibility finding above made pointless.
 
 ## Git / GitHub
 
