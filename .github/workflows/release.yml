@@ -60,6 +60,11 @@ jobs:
             exit 1
           fi
 
+      - name: Run the tests
+        env:
+          JELLYFIN_VERSION: ${{ inputs.jellyfin_version }}
+        run: dotnet test tests/Jellyfin.Plugin.Chromecast.Tests -p:JellyfinServerVersion="$JELLYFIN_VERSION"
+
       - name: Build
         env:
           JELLYFIN_VERSION: ${{ inputs.jellyfin_version }}

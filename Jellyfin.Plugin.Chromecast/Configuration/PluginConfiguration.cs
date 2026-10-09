@@ -17,6 +17,8 @@ public class PluginConfiguration : BasePluginConfiguration
         DeviceNamePrefix = string.Empty;
         UseUnstableReceiver = true;
         OpenReceiverOnConnect = true;
+        SkipSpeedTest = false;
+        StreamingBitrateMbps = 20;
         LastCastTargets = [];
         DeviceSettings = [];
         EnableDebugLogging = false;
@@ -55,6 +57,18 @@ public class PluginConfiguration : BasePluginConfiguration
     /// is closed again as soon as the user sends anything to the Chromecast they actually chose.
     /// </summary>
     public bool OpenReceiverOnConnect { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the receiver is told what bitrate to use
+    /// (<see cref="StreamingBitrateMbps"/>) instead of measuring the connection itself. Its
+    /// measurement takes 4 to 8 seconds before the first playback after the receiver opens.
+    /// </summary>
+    public bool SkipSpeedTest { get; set; }
+
+    /// <summary>
+    /// Gets or sets the bitrate, in megabits per second, used when <see cref="SkipSpeedTest"/> is on.
+    /// </summary>
+    public int StreamingBitrateMbps { get; set; }
 
     /// <summary>
     /// Gets or sets the Chromecast each user cast to last. Maintained by the plugin, not shown in

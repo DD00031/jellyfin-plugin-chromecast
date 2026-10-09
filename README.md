@@ -76,11 +76,13 @@ show Jellyfin's ready screen on it for a few seconds.
 
 | Setting | What it does |
 |---|---|
-| Discovery interval | How often the server looks for Chromecasts. Default: every 30 seconds. |
+| Discovery interval | How often the server looks for Chromecasts. Default: every 30 seconds. Raise it (to 120 or 300) if the server or network feels slower with the plugin installed; newly switched-on Chromecasts then take that long to appear. |
 | Device timeout | How long a Chromecast may go unseen before it leaves the cast menu. Default: 2 minutes. |
 | Device name prefix | Optional text put in front of each Chromecast's name in the cast menu. |
 | Use the unstable receiver build | On by default. The stable version of Jellyfin's Chromecast app can't load subtitle files that sit next to the video yet. |
 | Show the ready screen when you connect | On by default. Opens Jellyfin on the TV as soon as you connect, before you play anything. |
+| Skip the network speed test | Off by default. The Chromecast normally measures its connection to your server before the first video, which takes several seconds. Turn this on if your network is fast and steady, for a quicker start. Leave it off on slow or unreliable Wi-Fi, where the measurement prevents stuttering. |
+| Bitrate when the speed test is skipped | Default 20 Mbps, which suits a 1080p Chromecast on good Wi-Fi. Lower it if video stutters; raise it for a 4K Chromecast on a fast network. |
 | Verbose logging | Off by default. Writes every discovery scan and every message to the server log; turn it on when reporting a problem. |
 
 ## Good to know
@@ -145,6 +147,17 @@ dotnet build Jellyfin.Plugin.Chromecast/Jellyfin.Plugin.Chromecast.csproj
 Requires the .NET 10 SDK. Builds target the oldest supported Jellyfin (12.0.0) so one release
 serves every newer server too; pass `-p:JellyfinServerVersion=<version>` to compile against
 another one.
+
+## Tests
+
+```bash
+dotnet test tests/Jellyfin.Plugin.Chromecast.Tests
+```
+
+Unit tests cover the logic that doesn't need a Chromecast: telling a cast connect from a dashboard
+visit, the order of play requests, the exact message format the receiver expects, and timeouts.
+They run on every push and before every release. Anything involving a real device is tested by
+hand against real hardware.
 
 ## Releasing
 

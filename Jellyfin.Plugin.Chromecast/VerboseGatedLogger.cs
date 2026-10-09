@@ -16,13 +16,16 @@ internal sealed class VerboseGatedLogger<T> : ILogger<T>
     private readonly ILogger<T> _inner;
     private readonly bool _routineInfoIsVerbose;
 
-    public VerboseGatedLogger(ILogger<T> inner, bool routineInfoIsVerbose)
+    private readonly Func<bool> _isVerbose;
+
+    public VerboseGatedLogger(ILogger<T> inner, bool routineInfoIsVerbose, Func<bool>? isVerbose = null)
     {
         _inner = inner;
         _routineInfoIsVerbose = routineInfoIsVerbose;
+        _isVerbose = isVerbose ?? (static () => Plugin.Instance?.Configuration.EnableDebugLogging ?? false);
     }
 
-    private static bool Verbose => Plugin.Instance?.Configuration.EnableDebugLogging ?? false;
+    private bool Verbose => _isVerbose();
 
     public IDisposable? BeginScope<TState>(TState state)
         where TState : notnull

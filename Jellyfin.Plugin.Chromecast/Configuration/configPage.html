@@ -30,7 +30,7 @@
                     <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="DiscoveryIntervalSeconds">Discovery interval (seconds)</label>
                         <input id="DiscoveryIntervalSeconds" name="DiscoveryIntervalSeconds" type="number" is="emby-input" min="5" required />
-                        <div class="fieldDescription">How often to scan the local network for Chromecast devices.</div>
+                        <div class="fieldDescription">How often the server looks for Chromecasts on the network. A switched-on Chromecast appears within this time. If the server or your network feels slower since installing the plugin, raise it, for example to 120 or 300; new Chromecasts then take that long to show up, and nothing else changes.</div>
                     </div>
 
                     <div class="inputContainer">
@@ -59,6 +59,20 @@
                             <span>Show the ready screen when you connect</span>
                         </label>
                         <div class="fieldDescription">Opens Jellyfin on the Chromecast as soon as you connect to it in a Jellyfin app, before you play anything. Jellyfin apps don't tell the server which device you picked, so with more than one Chromecast the plugin opens the one you used last; if that was the wrong one, it closes again as soon as you do anything on the right one.</div>
+                    </div>
+
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input id="SkipSpeedTest" name="SkipSpeedTest" type="checkbox" is="emby-checkbox" />
+                            <span>Skip the network speed test (faster start)</span>
+                        </label>
+                        <div class="fieldDescription">Before the first video after it opens, the Chromecast measures how fast it can download from your server, which takes several seconds (4 to 8 in testing). <strong>Turn this on if your network is fast and steady</strong> (server on a cable, Chromecast with good Wi-Fi): videos start sooner and are sent at the bitrate below. <strong>Leave it off on slow or unreliable Wi-Fi</strong>: the measurement lets Jellyfin lower the quality to what the connection can handle, which prevents stuttering and buffering.</div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="StreamingBitrateMbps">Bitrate when the speed test is skipped (Mbps)</label>
+                        <input id="StreamingBitrateMbps" name="StreamingBitrateMbps" type="number" is="emby-input" min="1" max="500" required />
+                        <div class="fieldDescription">Only used with the option above. 20 suits a 1080p Chromecast on good Wi-Fi. Lower it (8 to 12) if video stutters; raise it (40 or more) for a 4K Chromecast on a fast network. Videos above this bitrate are converted down to it.</div>
                     </div>
 
                     <div class="checkboxContainer checkboxContainer-withDescription">
@@ -211,6 +225,8 @@
                         page.querySelector('#UseUnstableReceiver').checked = config.UseUnstableReceiver;
                         page.querySelector('#OpenReceiverOnConnect').checked = config.OpenReceiverOnConnect;
                         page.querySelector('#EnableDebugLogging').checked = config.EnableDebugLogging;
+                        page.querySelector('#SkipSpeedTest').checked = config.SkipSpeedTest;
+                        page.querySelector('#StreamingBitrateMbps').value = config.StreamingBitrateMbps;
                         loadDevices(page, config).then(function () {
                             Dashboard.hideLoadingMsg();
                         });
@@ -226,6 +242,8 @@
                         config.UseUnstableReceiver = page.querySelector('#UseUnstableReceiver').checked;
                         config.OpenReceiverOnConnect = page.querySelector('#OpenReceiverOnConnect').checked;
                         config.EnableDebugLogging = page.querySelector('#EnableDebugLogging').checked;
+                        config.SkipSpeedTest = page.querySelector('#SkipSpeedTest').checked;
+                        config.StreamingBitrateMbps = Number(page.querySelector('#StreamingBitrateMbps').value) || 20;
                         config.DeviceSettings = collectDeviceSettings(page, config);
 
                         ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {

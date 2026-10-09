@@ -133,23 +133,8 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     /// </summary>
     private volatile bool _ignoreNextStop;
 
-    /// <summary>
-    /// Guards the three fields below. The receiver handles each PlayNow independently and awaits
-    /// its own PlaybackInfo call before loading, so when two arrive close together the one whose
-    /// stream is ready last wins - not the one requested last (seen in testing: ten quick casts
-    /// ended on the ninth, a slow-starting transcode). So only one PlayNow is in flight at a time:
-    /// a newer request waits until the receiver reports the previous item, and only the newest
-    /// waiting request is kept.
-    /// </summary>
-    private readonly object _playLock = new();
-
-    private static readonly TimeSpan LoadTimeout = TimeSpan.FromSeconds(15);
-
-    private Guid _loadingItemId;
-
-    private DateTime _loadingSince;
-
-    private (PlayRequest Command, List<BaseItemDto> Items, User? User)? _pendingPlay;
+    /// <summary>Lets one PlayNow reach the receiver at a time; see <see cref="PlayRequestGate{TRequest}"/>.</summary>
+    private readonly PlayRequestGate<PlayRequest> _playGate = new(TimeSpan.FromSeconds(15));
 
     private DateTime _lastNotification;
 
@@ -563,18 +548,11 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             return;
         }
 
-        var firstItemId = items[command.StartIndex is { } start && start > 0 && start < items.Count ? start : 0].Id;
-        lock (_playLock)
+        var firstItemId = items[GetStartIndex(command, items.Count)].Id;
+        if (!_playGate.TryBegin(firstItemId, command, DateTime.UtcNow))
         {
-            if (_loadingItemId != Guid.Empty && DateTime.UtcNow - _loadingSince < LoadTimeout)
-            {
-                _pendingPlay = (command, items, user);
-                _logger.LogDebug("{Name} is still loading the previous request; {ItemName} will follow", _receiver.Name, items[0].Name);
-                return;
-            }
-
-            _loadingItemId = firstItemId;
-            _loadingSince = DateTime.UtcNow;
+            _logger.LogDebug("{Name} is still loading the previous request; {ItemName} will follow", _receiver.Name, items[0].Name);
+            return;
         }
 
         var sent = false;
@@ -586,18 +564,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         {
             if (!sent)
             {
-                ClearLoading(firstItemId);
-            }
-        }
-    }
-
-    private void ClearLoading(Guid itemId)
-    {
-        lock (_playLock)
-        {
-            if (_loadingItemId == itemId)
-            {
-                _loadingItemId = Guid.Empty;
+                _playGate.Abort(firstItemId);
             }
         }
     }
@@ -608,31 +575,18 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     /// </summary>
     private void OnReceiverReported(string type, Guid itemId)
     {
-        (PlayRequest Command, List<BaseItemDto> Items, User? User)? next;
-        lock (_playLock)
+        if (_playGate.Report(type, itemId, DateTime.UtcNow) is { } next)
         {
-            if (_loadingItemId == Guid.Empty)
-            {
-                return;
-            }
-
-            var stalled = DateTime.UtcNow - _loadingSince >= LoadTimeout;
-            var reported = type is "error" or "connectionerror" || (itemId == _loadingItemId && type is "playbackstart" or "playbackprogress" or "playstatechange");
-            if (!reported && !stalled)
-            {
-                return;
-            }
-
-            _loadingItemId = Guid.Empty;
-            next = _pendingPlay;
-            _pendingPlay = null;
-        }
-
-        if (next is { } pending)
-        {
-            _ = SendPlayCommand(pending.Command, CancellationToken.None);
+            _ = SendPlayCommand(next, CancellationToken.None);
         }
     }
+
+    /// <summary>
+    /// The item in a play request's list to start with: "play from here" sends the whole list
+    /// plus an index.
+    /// </summary>
+    internal static int GetStartIndex(PlayRequest command, int itemCount)
+        => command.StartIndex is { } index && index > 0 && index < itemCount ? index : 0;
 
     /// <summary>
     /// Whether this cast continues something the same user was just watching in a Jellyfin app's
@@ -645,7 +599,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             return false;
         }
 
-        var itemId = items[command.StartIndex is { } start && start > 0 && start < items.Count ? start : 0].Id;
+        var itemId = items[GetStartIndex(command, items.Count)].Id;
         var playingLocally = _sessionManager.Sessions.Any(s =>
             s.UserId.Equals(command.ControllingUserId)
             && s.NowPlayingItem?.Id == itemId
@@ -653,14 +607,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         return playingLocally || RemoteControlListener.WasJustPlayedLocally(command.ControllingUserId, itemId);
     }
 
-    private void ForgetPlayRequests()
-    {
-        lock (_playLock)
-        {
-            _loadingItemId = Guid.Empty;
-            _pendingPlay = null;
-        }
-    }
+    private void ForgetPlayRequests() => _playGate.Clear();
 
     private async Task<bool> SendPlayNowAsync(PlayRequest command, List<BaseItemDto> items, User? user, CancellationToken cancellationToken)
     {
@@ -788,10 +735,9 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         return _connectSdkChannel.SendCommandAsync(receiverCommand, _session.UserId, _mintedAccessToken, _serverAddress, _receiver.Name, options, _appTransportId);
     }
 
-    private static PlayNowOptions BuildPlayNowOptions(List<BaseItemDto> items, PlayRequest command)
+    internal static PlayNowOptions BuildPlayNowOptions(List<BaseItemDto> items, PlayRequest command)
     {
-        // "Play from here" in a list sends the whole list plus the index to start at.
-        var startIndex = command.StartIndex is { } index && index > 0 && index < items.Count ? index : 0;
+        var startIndex = GetStartIndex(command, items.Count);
 
         return new PlayNowOptions
         {
@@ -814,7 +760,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     /// item page often send the indices without a media source id, so fill in the item's first
     /// source whenever an index was actually requested.
     /// </summary>
-    private static string? ResolveMediaSourceId(BaseItemDto item, string? mediaSourceId, int? audioStreamIndex, int? subtitleStreamIndex)
+    internal static string? ResolveMediaSourceId(BaseItemDto item, string? mediaSourceId, int? audioStreamIndex, int? subtitleStreamIndex)
     {
         if (!string.IsNullOrEmpty(mediaSourceId) || (audioStreamIndex is null && subtitleStreamIndex is null))
         {
@@ -1160,7 +1106,7 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             {
                 // No built-in timeout on SharpCaster requests; the device may also just drop the
                 // connection once the app is gone instead of answering.
-                await Task.WhenAny(client.ReceiverChannel.StopApplication(), Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false);
+                await client.ReceiverChannel.StopApplication().WithTimeoutAsync(CastTimeout.Command, "Closing the receiver").ConfigureAwait(false);
                 _logger.LogInformation("Closed the Jellyfin receiver on {Name}", _receiver.Name);
             }
             catch (Exception ex)
@@ -1236,31 +1182,45 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             return Task.CompletedTask;
         }
 
-        var currentVolume = _client.ChromecastStatus?.Volume?.Level ?? 0.5;
-        var isMuted = _client.ChromecastStatus?.Volume?.Muted ?? false;
+        var client = _client;
+        var currentVolume = client.ChromecastStatus?.Volume?.Level ?? 0.5;
+        var isMuted = client.ChromecastStatus?.Volume?.Muted ?? false;
 
         switch (command.Name)
         {
             case GeneralCommandType.VolumeUp:
-                return _client.ReceiverChannel.SetVolume(Math.Clamp(currentVolume + 0.05, 0, 1));
+                return SetVolumeAsync(client, () => client.ReceiverChannel.SetVolume(Math.Clamp(currentVolume + 0.05, 0, 1)));
             case GeneralCommandType.VolumeDown:
-                return _client.ReceiverChannel.SetVolume(Math.Clamp(currentVolume - 0.05, 0, 1));
+                return SetVolumeAsync(client, () => client.ReceiverChannel.SetVolume(Math.Clamp(currentVolume - 0.05, 0, 1)));
             case GeneralCommandType.Mute:
-                return _client.ReceiverChannel.SetMute(true);
+                return SetVolumeAsync(client, () => client.ReceiverChannel.SetMute(true));
             case GeneralCommandType.Unmute:
-                return _client.ReceiverChannel.SetMute(false);
+                return SetVolumeAsync(client, () => client.ReceiverChannel.SetMute(false));
             case GeneralCommandType.ToggleMute:
-                return _client.ReceiverChannel.SetMute(!isMuted);
+                return SetVolumeAsync(client, () => client.ReceiverChannel.SetMute(!isMuted));
             case GeneralCommandType.SetVolume:
                 if (command.Arguments.TryGetValue("Volume", out var volStr)
                     && double.TryParse(volStr, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var vol))
                 {
-                    return _client.ReceiverChannel.SetVolume(Math.Clamp(vol / 100d, 0, 1));
+                    return SetVolumeAsync(client, () => client.ReceiverChannel.SetVolume(Math.Clamp(vol / 100d, 0, 1)));
                 }
 
                 return Task.CompletedTask;
             default:
                 return Task.CompletedTask;
+        }
+    }
+
+    private async Task SetVolumeAsync(ChromecastClient client, Func<Task> change)
+    {
+        try
+        {
+            await change().WithTimeoutAsync(CastTimeout.Command, "A volume change").ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error changing the volume on Chromecast {Name}", _receiver.Name);
+            HandleConnectionLost(client, "a volume command failed");
         }
     }
 
@@ -1322,13 +1282,11 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     /// The device id Jellyfin's receiver gives itself: JavaScript's <c>btoa(receiverName)</c>, which
     /// encodes the name as Latin-1. Names btoa can't encode fall back to an id of our own.
     /// </summary>
-    private string GetReceiverDeviceId()
-    {
-        var name = _receiver.Name;
-        return name.All(c => c <= 0xFF)
-            ? Convert.ToBase64String(System.Text.Encoding.Latin1.GetBytes(name))
-            : "chromecast-receiver-" + _session.DeviceId;
-    }
+    private string GetReceiverDeviceId() => GetReceiverDeviceId(_receiver.Name) ?? "chromecast-receiver-" + _session.DeviceId;
+
+    /// <summary>JavaScript's <c>btoa(name)</c>, or null where btoa would throw (characters beyond Latin-1).</summary>
+    internal static string? GetReceiverDeviceId(string name)
+        => name.All(c => c <= 0xFF) ? Convert.ToBase64String(System.Text.Encoding.Latin1.GetBytes(name)) : null;
 
     private async Task<(string? AccessToken, User? User)> GetAccessTokenAsync(User? user, CancellationToken cancellationToken)
     {
@@ -1430,7 +1388,27 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             client.AddChannel(connectSdkChannel);
             connectSdkChannel.StatusReceived += OnConnectSdkStatusReceived;
 
-            await client.ConnectChromecast(_receiver).ConfigureAwait(false);
+            try
+            {
+                await client.ConnectChromecast(_receiver).WithTimeoutAsync(CastTimeout.Connect, "Connecting").ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                // Don't leave a half-open connection behind.
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await client.DisconnectAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Error abandoning a connection attempt to {Name}", _receiver.Name);
+                    }
+                });
+                throw;
+            }
+
             client.Disconnected += OnClientDisconnected;
 
             _client = client;

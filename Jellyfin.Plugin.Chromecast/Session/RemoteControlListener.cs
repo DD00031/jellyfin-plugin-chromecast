@@ -34,7 +34,7 @@ public sealed class RemoteControlListener : IWebSocketListener
     private readonly ILogger<RemoteControlListener> _logger;
     private static readonly ConcurrentDictionary<Guid, (Guid ItemId, DateTime At)> RecentLocalStops = new();
 
-    private readonly ConcurrentDictionary<IWebSocketConnection, ConnectionState> _connections = new();
+    private readonly RemoteSubscriptions<IWebSocketConnection> _subscriptions = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="RemoteControlListener"/> class.
@@ -76,7 +76,7 @@ public sealed class RemoteControlListener : IWebSocketListener
     /// <inheritdoc />
     public Task ProcessWebSocketConnectedAsync(IWebSocketConnection connection, HttpContext httpContext)
     {
-        connection.Closed += (_, _) => _connections.TryRemove(connection, out _);
+        connection.Closed += (_, _) => _subscriptions.Closed(connection);
         return Task.CompletedTask;
     }
 
@@ -93,32 +93,21 @@ public sealed class RemoteControlListener : IWebSocketListener
         switch (message.MessageType)
         {
             case SessionMessageType.ScheduledTasksInfoStart:
-                _connections.GetOrAdd(connection, _ => new ConnectionState()).TasksSubscribed = true;
+                _subscriptions.TasksStarted(connection);
                 break;
 
             case SessionMessageType.ScheduledTasksInfoStop:
-                if (_connections.TryGetValue(connection, out var tasksState))
-                {
-                    tasksState.TasksSubscribed = false;
-                }
-
+                _subscriptions.TasksStopped(connection);
                 break;
 
             case SessionMessageType.SessionsStart:
-                var state = _connections.GetOrAdd(connection, _ => new ConnectionState());
-                var generation = Interlocked.Increment(ref state.Generation);
-                _ = ConfirmRemoteControlAsync(connection, state, generation, userId);
+                _ = ConfirmRemoteControlAsync(connection, _subscriptions.SessionsStarted(connection), userId);
                 break;
 
             case SessionMessageType.SessionsStop:
-                if (_connections.TryGetValue(connection, out var stopState))
+                if (_subscriptions.SessionsStopped(connection))
                 {
-                    Interlocked.Increment(ref stopState.Generation);
-                    if (stopState.RemoteControlling)
-                    {
-                        stopState.RemoteControlling = false;
-                        OnRemoteControlEnded(connection, userId);
-                    }
+                    OnRemoteControlEnded(connection, userId);
                 }
 
                 break;
@@ -127,17 +116,16 @@ public sealed class RemoteControlListener : IWebSocketListener
         return Task.CompletedTask;
     }
 
-    private async Task ConfirmRemoteControlAsync(IWebSocketConnection connection, ConnectionState state, int generation, Guid userId)
+    private async Task ConfirmRemoteControlAsync(IWebSocketConnection connection, int ticket, Guid userId)
     {
         try
         {
             await Task.Delay(DashboardGracePeriod).ConfigureAwait(false);
-            if (Volatile.Read(ref state.Generation) != generation || state.TasksSubscribed)
+            if (!_subscriptions.ConfirmRemoteControl(connection, ticket))
             {
                 return;
             }
 
-            state.RemoteControlling = true;
             _logger.LogInformation("{Device} connected to a remote player", connection.AuthorizationInfo.Device);
 
             var config = Plugin.Instance?.Configuration;
@@ -166,7 +154,7 @@ public sealed class RemoteControlListener : IWebSocketListener
     private void OnRemoteControlEnded(IWebSocketConnection connection, Guid userId)
     {
         // Another of this user's devices may still be connected to the same Chromecast.
-        if (_connections.Any(c => c.Value.RemoteControlling && c.Key.AuthorizationInfo?.UserId == userId))
+        if (_subscriptions.AnyRemoteControlling(c => c.AuthorizationInfo?.UserId == userId))
         {
             return;
         }
@@ -180,13 +168,4 @@ public sealed class RemoteControlListener : IWebSocketListener
 
     private IEnumerable<ChromecastSessionController> GetControllers()
         => _sessionManager.Sessions.SelectMany(s => s.SessionControllers).OfType<ChromecastSessionController>();
-
-    private sealed class ConnectionState
-    {
-        public int Generation;
-
-        public volatile bool TasksSubscribed;
-
-        public volatile bool RemoteControlling;
-    }
 }

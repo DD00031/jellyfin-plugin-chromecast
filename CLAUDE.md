@@ -206,13 +206,17 @@ Jellyfin.Plugin.Chromecast/
     ConnectSdkMessages.cs                     - DTOs for the connectsdk message shapes above
   Api/
     ChromecastController.cs                   - admin API for the settings page (device list, test)
+  Cast/CastTimeout.cs                         - timeout wrapper for every call to the device
   Session/
+    RemoteSubscriptions.cs                    - connect/disconnect detection logic (pure, unit-tested)
+    PlayRequestGate.cs                        - one PlayNow in flight at a time (pure, unit-tested)
     ChromecastSessionController.cs            - ISessionController: Jellyfin commands -> connectsdk commands,
                                                  connectsdk status -> Jellyfin session state
     RemoteControlListener.cs                  - IWebSocketListener: detects clients connecting to /
                                                  disconnecting from a remote player
   VerboseGatedLogger.cs                       - ties routine/debug log output to the "Verbose logging" setting
 external/Sharpcaster/                         - vendored + patched SharpCaster (see PATCH.md)
+tests/Jellyfin.Plugin.Chromecast.Tests/       - unit tests (dotnet test tests/Jellyfin.Plugin.Chromecast.Tests)
 ```
 
 ## Current status (as of this writing)
@@ -845,6 +849,34 @@ confirmed working) plus four problems:
   stopped it. Not yet confirmed with the real iOS app.
 - `VerboseGatedLogger` no longer promotes Trace (every heartbeat and raw frame); only Debug.
 
+### 0.1.6.0 (2026-10-09): timeouts everywhere, tests, skip-speed-test setting
+
+- **Timeouts on every call to the device** (`Cast/CastTimeout.cs`, `WithTimeoutAsync`): connect
+  (8 s, abandoning the half-open client), every connectsdk send, volume/mute and
+  `StopApplication` (5 s each). A timeout on volume now also discards the connection
+  (`HandleConnectionLost`). Before this only launch, keep-alive and the liveness check were covered.
+- **Unit tests** (`tests/Jellyfin.Plugin.Chromecast.Tests`, xunit, 54 tests; run with
+  `dotnet test tests/Jellyfin.Plugin.Chromecast.Tests`). To make the trickiest logic testable
+  without a server it was extracted, unchanged in behavior, into two dependency-free classes:
+  `Session/RemoteSubscriptions.cs` (connect/disconnect vs. dashboard, from WebSocket subscription
+  messages) and `Session/PlayRequestGate.cs` (one PlayNow in flight, newest waiting one kept).
+  Also covered: the JSON the receiver reads (envelope and option casing, `startIndex`,
+  `maxBitrate`), media-source fill-in, start index, the `btoa` device id (checked against the id
+  the real receiver reported), `CastTimeout`, `FlexibleGuidConverter`, `VerboseGatedLogger`.
+  The plugin exposes internals to the test assembly (`InternalsVisibleTo` in the `.csproj`). The
+  test project references Jellyfin.Controller/Model *with* runtime assets (the plugin excludes
+  them). A deliberately broken gate failed 8 tests, so they do bite. `.github/workflows/tests.yml`
+  runs them on push/PR and `release.yml` runs them before building. Device behavior is still
+  verified by hand on real hardware - re-run the live checks after touching the controller.
+- **Skip the receiver's speed test** (`SkipSpeedTest`, off by default, with
+  `StreamingBitrateMbps`, default 20): when on, every envelope carries `maxBitrate` (bits/s), which
+  the receiver stores as `window.MaxBitrate` and uses instead of measuring. Measured from a cold
+  receiver: 9.6 s to the first video request with 12 `/Playback/BitrateTest` downloads, vs 5.3 s
+  with none and `VideoBitrate=19871791` in the stream URL. Turning it off again only takes effect
+  for a receiver instance that never received a value (i.e. after the receiver is next closed).
+- The settings page explains both, and the discovery interval now says to raise it if the server
+  or network feels slower.
+
 ### Investigated, fixed by server config (not this plugin): subtitles drift after seeking
 
 Reported: subtitles are in sync when playback just runs, but lag after seeking. Reproduced
@@ -887,9 +919,6 @@ the unstable default.
   within about a minute and the first connect after it restarts; the transfer-then-close-player
   case in the iOS app; the wrong-guess correction with two Chromecasts in use. Jellyfin 12.1 is
   untested (12.0 and 12.2 are).
-- The first cast after connecting pays the receiver's ~8 s bandwidth test if the connect guess
-  didn't already open it. Passing `maxBitrate` in the envelope would skip it at the cost of the
-  automatic measurement.
 - Consider proposing the Sharpcaster patches upstream (see `external/Sharpcaster/PATCH.md`)
   to eventually drop the vendoring. The 5 s keep-alive tick is no longer optional hardening: the
   idle close and the stalled-play-request check run from it.

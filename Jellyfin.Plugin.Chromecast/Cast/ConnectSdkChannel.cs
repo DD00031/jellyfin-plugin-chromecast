@@ -54,6 +54,20 @@ public sealed class ConnectSdkChannel(ILogger<ConnectSdkChannel> logger)
     /// </param>
     public Task SendCommandAsync(string command, Guid userId, string accessToken, string serverAddress, string receiverName, object? options, string transportId)
     {
+        var config = Plugin.Instance?.Configuration;
+        var maxBitrate = config is { SkipSpeedTest: true } ? Math.Clamp(config.StreamingBitrateMbps, 1, 500) * 1_000_000L : (long?)null;
+        var json = BuildEnvelope(command, userId, accessToken, serverAddress, receiverName, options, maxBitrate);
+        Logger?.LogDebug("connectsdk -> {TransportId}: {Json}", transportId, json);
+        return SendAsync(json, transportId).WithTimeoutAsync(CastTimeout.Command, $"The \"{command}\" command");
+    }
+
+    /// <summary>
+    /// Builds the JSON the receiver expects. <paramref name="maxBitrate"/> (bits per second), when
+    /// set, makes the receiver use that figure instead of measuring the connection itself - its
+    /// measurement downloads up to 10 MB and takes 4 to 8 seconds before the first playback.
+    /// </summary>
+    internal static string BuildEnvelope(string command, Guid userId, string accessToken, string serverAddress, string receiverName, object? options, long? maxBitrate)
+    {
         var envelope = new
         {
             command,
@@ -61,12 +75,11 @@ public sealed class ConnectSdkChannel(ILogger<ConnectSdkChannel> logger)
             accessToken,
             serverAddress,
             receiverName,
+            maxBitrate,
             options = options ?? new { }
         };
 
-        var json = JsonSerializer.Serialize(envelope, SerializerOptions);
-        Logger?.LogDebug("connectsdk -> {TransportId}: {Json}", transportId, json);
-        return SendAsync(json, transportId);
+        return JsonSerializer.Serialize(envelope, SerializerOptions);
     }
 
     /// <inheritdoc />

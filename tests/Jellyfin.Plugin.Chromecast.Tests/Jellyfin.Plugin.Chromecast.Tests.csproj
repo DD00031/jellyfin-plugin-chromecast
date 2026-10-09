@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <JellyfinServerVersion Condition="'$(JellyfinServerVersion)' == ''">12.0.0</JellyfinServerVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- The plugin excludes these at runtime (the server provides them); tests need the real thing. -->
+    <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinServerVersion)" />
+    <PackageReference Include="Jellyfin.Model" Version="$(JellyfinServerVersion)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Jellyfin.Plugin.Chromecast\Jellyfin.Plugin.Chromecast.csproj" />
+  </ItemGroup>
+
+</Project>
