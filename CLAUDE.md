@@ -162,10 +162,13 @@ Confirmed by reading the actual server source
 `AuthenticateNewSessionInternal(request, enforcePassword: false)` - i.e. it looks the user up by
 ID and skips password validation entirely. This is the same category of trusted, in-process
 mechanism used elsewhere in Jellyfin for "phantom" devices; a server-side plugin runs with full
-server trust, so this is the intended pattern, not a workaround. The token is revoked
-(`ISessionManager.Logout(token)`) when the cast session stops, disconnects, or errors, with a
-configurable fallback expiry as a safety net (`PluginConfiguration.AccessTokenLifetimeMinutes`) in
-case revocation is missed (e.g. a server restart mid-cast).
+server trust, so this is the intended pattern, not a workaround. The token is reused for as long
+as the receiver stays open (minting another for the same device id logs the previous one out) and
+revoked (`ISessionManager.Logout(token)`) when the receiver is closed or the CastV2 connection
+drops. There is no expiry fallback: the old `AccessTokenLifetimeMinutes` setting was never read
+and was removed in 0.1.4.0. Every mint counts against the user's "max simultaneous sessions"
+limit (`SessionManager` refuses when the user's existing session count already reaches it); the
+plugin logs a specific error for that and the settings page and README warn about it.
 
 ## Vendored SharpCaster
 
@@ -204,6 +207,9 @@ Jellyfin.Plugin.Chromecast/
   Session/
     ChromecastSessionController.cs            - ISessionController: Jellyfin commands -> connectsdk commands,
                                                  connectsdk status -> Jellyfin session state
+    RemoteControlListener.cs                  - IWebSocketListener: detects clients connecting to /
+                                                 disconnecting from a remote player
+  VerboseGatedLogger.cs                       - ties routine/debug log output to the "Verbose logging" setting
 external/Sharpcaster/                         - vendored + patched SharpCaster (see PATCH.md)
 ```
 
@@ -675,6 +681,66 @@ closed our connection mid-request (`Client disconnected before receiving respons
 plausible cause of the user's "stream breaks under rapid switching" report; joining instead of
 relaunching removes the same-app variant of it, but it is not confirmed as the cause.
 
+### RESOLVED: connect / stop / disconnect flow (supersedes "close on Stop" above)
+
+The user's intended flow: connect → ready screen immediately; open an item → TV mirrors it; play;
+Stop → back to the ready screen (receiver stays open); Disconnect → receiver closes. The earlier
+"close the receiver 2 s after Stop / after 3 min idle" behavior was wrong for that and is gone.
+
+**Clients do signal connect and disconnect, just not the target.** Captured from the real 12.0
+web client by hooking `WebSocket.prototype.send` in a browser signed in via Quick Connect
+(`POST /QuickConnect/Authorize?code=..&userId=..` with the admin API key - no password needed):
+- Connect to a remote player: `{"MessageType":"SessionsStart","Data":"0,1000"}`. (The source asks
+  for a `100,800` interval, but the bundled SDK falls back to its default - do not filter on it.)
+- Disconnect: `{"MessageType":"SessionsStop"}`.
+- Opening the **dashboard** sends the same `SessionsStart` *plus* `ScheduledTasksInfoStart` in the
+  same instant; leaving sends `ScheduledTasksInfoStop` then `SessionsStop`.
+- The SDK de-duplicates per message type, so a page that is both connected and on the dashboard
+  sends one Start and one Stop in total.
+
+`Session/RemoteControlListener.cs` is an `IWebSocketListener` (registered in
+`PluginServiceRegistrator`; `WebSocketManager` takes `IEnumerable<IWebSocketListener>` from DI, so
+plugin listeners see every inbound message with its connection's `AuthorizationInfo`). A
+`SessionsStart` counts as a remote-player connect only if no `ScheduledTasksInfo` subscription is
+active on that connection or arrives within 1.5 s; `SessionsStop` on a connection marked that way
+is a disconnect. A closed socket (app backgrounded, phone locked) is not.
+
+- **Connect** (`OpenReceiverOnConnect`, default on): the target is unknown, so
+  `OnRemoteControlStartedAsync` opens the ready screen (`Identify`) on the Chromecast that user
+  cast to last (`PluginConfiguration.LastCastTargets`, saved to the plugin XML so it survives
+  restarts), or on the only active one. A wrong guess corrects itself: the first real command
+  from that user to any Chromecast closes every other one still marked `_openedOnConnectFor` them.
+  Measured: ready screen ~4.5 s after the click (1.5 s dashboard check + launch).
+- **Stop**: only the receiver's `Stop`. It returns to its Waiting screen itself; the token stays
+  valid because the receiver's backdrop rotation keeps using it.
+- **Disconnect**: `OnRemoteControlEndedAsync` on every controller whose last controlling user (or
+  connect-guess user) matches, unless another connection of that user is still remote-controlling:
+  receiver `Stop`, 2 s for it to report, `StopApplication`, disconnect, revoke the token.
+- **Fallback**: `IdleCloseAfter` is now 30 minutes with nothing loaded and no commands, for
+  disconnects that are never seen (app killed).
+
+Verified end to end by driving the real web UI against Eettafel TV (connect with no history → no
+guess; item page → launch; play with subtitles; Stop → app stays, `rs=Jellyfin for Google Cast
+Beta` in the device's mDNS record; Disconnect → closed, `rs=` empty; reconnect → ready screen;
+dashboard open/leave → nothing). **Not yet tested:** the wrong-guess correction with two
+Chromecasts actually in use, and the iOS app itself (same web client, so expected to match).
+Testing tip: with the Browser pane hidden, jellyfin-web dialogs never finish closing because
+their handlers wait for a CSS `animationend`; dispatch that event on `.dialog`/`.dialogContainer`
+manually.
+
+Also in this round:
+- **The settings page never worked (since 0.1.0.0).** `configPage.html` had its `<script>` after
+  the `data-role="page"` element; Jellyfin's dashboard only injects that element, so the script
+  never ran - fields stayed empty and Save did nothing (confirmed: no plugin script in the DOM).
+  The script now lives inside the page element. Verified in the real dashboard: values load, Save
+  persists, `LastCastTargets` survives a save. The settings page also gained the session-limit
+  note and the connect option, and lost the dead token-lifetime field.
+- **Log noise**: SharpCaster's `ChromecastLocator` logs several Information lines per scan, every
+  30 s. `VerboseGatedLogger<T>` now wraps the loggers handed to the locator, `ChromecastClient`
+  and `ConnectSdkChannel`: routine output only appears when the plugin's "Verbose logging" setting
+  is on (read per call, no restart), and Debug output is then written at Information so no
+  `logging.json` edit is needed. That setting was previously wired to nothing.
+
 ### Investigated, fixed by server config (not this plugin): subtitles drift after seeking
 
 Reported: subtitles are in sync when playback just runs, but lag after seeking. Reproduced
@@ -719,10 +785,15 @@ the unstable default.
   macOS's `dns-sd -B _googlecast._tcp` still listed it and its cast port answered. Worth looking at
   (Zeroconf query behavior, or a longer stale timeout) - possibly related to the rapid-switching
   report too.
-- `PluginConfiguration.AccessTokenLifetimeMinutes` is unused (see above) - implement or remove.
-- The minted token's device id is `"chromecast-" + _session.DeviceId`, but the session's device id
-  already starts with `chromecast-`, giving a third session named `chromecast-chromecast-...` in
-  `/Sessions`. Cosmetic.
+- **Sessions per cast.** Each cast leaves the user with two extra Jellyfin sessions (the minted
+  token's `chromecast-chromecast-...` one and the receiver's own `base64(name)` one). Minting with
+  the device id the receiver will use (`btoa(receiverName)`, Latin-1) and its client name would
+  merge them into one and halve the hit on session limits - untested.
+- **StartIndex is not forwarded** in `PlayNowOptions`, so "play from here" in a list always starts
+  at the first item.
+- The first cast after connecting without opening an item page still pays the receiver's ~8 s
+  bandwidth test unless the connect guess already opened it. Passing `maxBitrate` in the envelope
+  would skip it at the cost of the automatic measurement.
 - Decide whether the `HeartbeatChannel.AdditionalDestinationId` patch and the plugin's own 5s
   keep-alive timer are still worth keeping now that the real fix (patch 4, the receive-loop
   try/catch) is in - they were reasonable hardening added while still hypothesizing about the

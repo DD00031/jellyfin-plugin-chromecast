@@ -1,5 +1,7 @@
 using Jellyfin.Plugin.Chromecast.Discovery;
+using Jellyfin.Plugin.Chromecast.Session;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Net;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -15,5 +17,6 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
     public void RegisterServices(IServiceCollection serviceCollection, IServerApplicationHost applicationHost)
     {
         serviceCollection.AddHostedService<ChromecastHost>();
+        serviceCollection.AddSingleton<IWebSocketListener, RemoteControlListener>();
     }
 }

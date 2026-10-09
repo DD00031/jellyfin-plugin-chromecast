@@ -62,7 +62,9 @@ public sealed class ChromecastDiscoveryManager : IDisposable
         _dtoService = dtoService;
         _appHost = appHost;
 
-        _locator = new ChromecastLocator(loggerFactory.CreateLogger<ChromecastLocator>());
+        // The locator logs several Information lines per scan (every 30 s, forever) - only show
+        // them when the plugin's "Verbose logging" setting is on.
+        _locator = new ChromecastLocator(new VerboseGatedLogger<ChromecastLocator>(loggerFactory.CreateLogger<ChromecastLocator>(), routineInfoIsVerbose: true));
 
         var staleCheckInterval = TimeSpan.FromSeconds(Math.Max(15, GetConfig().DeviceStaleAfterSeconds / 2));
         _staleSweepTimer = new Timer(SweepStaleDevices, null, staleCheckInterval, staleCheckInterval);

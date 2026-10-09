@@ -16,7 +16,8 @@ public class PluginConfiguration : BasePluginConfiguration
         DeviceStaleAfterSeconds = 120;
         DeviceNamePrefix = string.Empty;
         UseUnstableReceiver = true;
-        AccessTokenLifetimeMinutes = 180;
+        OpenReceiverOnConnect = true;
+        LastCastTargets = [];
         EnableDebugLogging = false;
     }
 
@@ -47,14 +48,38 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool UseUnstableReceiver { get; set; }
 
     /// <summary>
-    /// Gets or sets how long (in minutes) the access token minted for the receiver on cast start
-    /// remains valid before it is force-revoked as a safety net, in case normal revocation on stop
-    /// is missed (e.g. server restart mid-cast).
+    /// Gets or sets a value indicating whether to open the receiver's "ready" screen as soon as a
+    /// Jellyfin client connects to a remote player. Clients don't say which target they picked, so
+    /// this opens the Chromecast that user cast to last (or the only one there is); a wrong guess
+    /// is closed again as soon as the user sends anything to the Chromecast they actually chose.
     /// </summary>
-    public int AccessTokenLifetimeMinutes { get; set; }
+    public bool OpenReceiverOnConnect { get; set; }
 
     /// <summary>
-    /// Gets or sets a value indicating whether verbose Chromecast/CastV2 protocol logging is enabled.
+    /// Gets or sets the Chromecast each user cast to last. Maintained by the plugin, not shown in
+    /// the settings page; kept here so the connect guess survives server restarts.
+    /// </summary>
+    public LastCastTarget[] LastCastTargets { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether routine discovery output and CastV2 protocol
+    /// detail are written to the server log (see <c>VerboseGatedLogger</c>).
     /// </summary>
     public bool EnableDebugLogging { get; set; }
+}
+
+/// <summary>
+/// The Chromecast a user cast to last.
+/// </summary>
+public class LastCastTarget
+{
+    /// <summary>
+    /// Gets or sets the user's id.
+    /// </summary>
+    public System.Guid UserId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the Chromecast session's device id.
+    /// </summary>
+    public string DeviceId { get; set; } = string.Empty;
 }

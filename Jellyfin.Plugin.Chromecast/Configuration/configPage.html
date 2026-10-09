@@ -11,6 +11,7 @@
                     <div class="verticalSection">
                         <h2>Chromecast</h2>
                         <p>Discovers Google Cast devices on the local network and adds them to Jellyfin's built-in cast interface on every client, including iOS/iPadOS/macOS.</p>
+                        <p><strong>Each cast uses Jellyfin sessions of the user who started it</strong> (the Chromecast signs in to Jellyfin as that user). If a user has a limit under Dashboard &rarr; Users &rarr; (user) &rarr; <em>Max number of simultaneous user sessions</em>, set it to 0 (unlimited), or leave room for 2 extra sessions per Chromecast on top of the devices that user is signed in on. Otherwise casting fails for that user.</p>
                     </div>
 
                     <div class="inputContainer">
@@ -39,10 +40,12 @@
                         <div class="fieldDescription">On by default: the stable receiver can't load external subtitle files (.srt next to the video) until Jellyfin releases its fix. Turn off to use the stable receiver. Matches the "Google Cast version" option available to web/Chrome users.</div>
                     </div>
 
-                    <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="AccessTokenLifetimeMinutes">Access token safety-net lifetime (minutes)</label>
-                        <input id="AccessTokenLifetimeMinutes" name="AccessTokenLifetimeMinutes" type="number" is="emby-input" min="10" required />
-                        <div class="fieldDescription">The token minted for the receiver on cast start is revoked when playback stops; this is a fallback expiry in case that is missed (e.g. a server restart mid-cast).</div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input id="OpenReceiverOnConnect" name="OpenReceiverOnConnect" type="checkbox" is="emby-checkbox" />
+                            <span>Show the ready screen when you connect</span>
+                        </label>
+                        <div class="fieldDescription">Opens Jellyfin on the Chromecast as soon as you connect to it in a Jellyfin app, before you play anything. Jellyfin apps don't tell the server which device you picked, so with more than one Chromecast the plugin opens the one you used last; if that was the wrong one, it closes again as soon as you do anything on the right one.</div>
                     </div>
 
                     <div class="checkboxContainer checkboxContainer-withDescription">
@@ -50,7 +53,7 @@
                             <input id="EnableDebugLogging" name="EnableDebugLogging" type="checkbox" is="emby-checkbox" />
                             <span>Enable verbose logging</span>
                         </label>
-                        <div class="fieldDescription">Logs CastV2 protocol and discovery detail to the server log. Only enable while troubleshooting.</div>
+                        <div class="fieldDescription">Writes every discovery scan and every message exchanged with the Chromecast to the server log. Off by default to keep the log clean; turn on while troubleshooting. Takes effect immediately.</div>
                     </div>
 
                     <div>
@@ -61,52 +64,54 @@
                 </form>
             </div>
         </div>
-    </div>
-    <script type="text/javascript">
-        (function () {
-            const pluginId = '06afff54-6a74-4e08-9d50-9fa63803c73d';
+        <!-- Must stay inside the page element: Jellyfin only loads that element, so a script
+             placed after it never runs and the form neither loads nor saves. -->
+        <script type="text/javascript">
+            (function () {
+                const pluginId = '06afff54-6a74-4e08-9d50-9fa63803c73d';
 
-            function loadConfig(page) {
-                Dashboard.showLoadingMsg();
-                ApiClient.getPluginConfiguration(pluginId).then(function (config) {
-                    page.querySelector('#DiscoveryIntervalSeconds').value = config.DiscoveryIntervalSeconds;
-                    page.querySelector('#DeviceStaleAfterSeconds').value = config.DeviceStaleAfterSeconds;
-                    page.querySelector('#DeviceNamePrefix').value = config.DeviceNamePrefix;
-                    page.querySelector('#UseUnstableReceiver').checked = config.UseUnstableReceiver;
-                    page.querySelector('#AccessTokenLifetimeMinutes').value = config.AccessTokenLifetimeMinutes;
-                    page.querySelector('#EnableDebugLogging').checked = config.EnableDebugLogging;
-                    Dashboard.hideLoadingMsg();
-                });
-            }
-
-            function saveConfig(page) {
-                Dashboard.showLoadingMsg();
-                ApiClient.getPluginConfiguration(pluginId).then(function (config) {
-                    config.DiscoveryIntervalSeconds = Number(page.querySelector('#DiscoveryIntervalSeconds').value);
-                    config.DeviceStaleAfterSeconds = Number(page.querySelector('#DeviceStaleAfterSeconds').value);
-                    config.DeviceNamePrefix = page.querySelector('#DeviceNamePrefix').value;
-                    config.UseUnstableReceiver = page.querySelector('#UseUnstableReceiver').checked;
-                    config.AccessTokenLifetimeMinutes = Number(page.querySelector('#AccessTokenLifetimeMinutes').value);
-                    config.EnableDebugLogging = page.querySelector('#EnableDebugLogging').checked;
-
-                    ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
-                        Dashboard.processPluginConfigurationUpdateResult(result);
+                function loadConfig(page) {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        page.querySelector('#DiscoveryIntervalSeconds').value = config.DiscoveryIntervalSeconds;
+                        page.querySelector('#DeviceStaleAfterSeconds').value = config.DeviceStaleAfterSeconds;
+                        page.querySelector('#DeviceNamePrefix').value = config.DeviceNamePrefix;
+                        page.querySelector('#UseUnstableReceiver').checked = config.UseUnstableReceiver;
+                        page.querySelector('#OpenReceiverOnConnect').checked = config.OpenReceiverOnConnect;
+                        page.querySelector('#EnableDebugLogging').checked = config.EnableDebugLogging;
+                        Dashboard.hideLoadingMsg();
                     });
-                });
-            }
+                }
 
-            document.querySelector('#ChromecastConfigPage')
-                .addEventListener('pageshow', function () {
-                    loadConfig(this);
-                });
+                function saveConfig(page) {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        config.DiscoveryIntervalSeconds = Number(page.querySelector('#DiscoveryIntervalSeconds').value);
+                        config.DeviceStaleAfterSeconds = Number(page.querySelector('#DeviceStaleAfterSeconds').value);
+                        config.DeviceNamePrefix = page.querySelector('#DeviceNamePrefix').value;
+                        config.UseUnstableReceiver = page.querySelector('#UseUnstableReceiver').checked;
+                        config.OpenReceiverOnConnect = page.querySelector('#OpenReceiverOnConnect').checked;
+                        config.EnableDebugLogging = page.querySelector('#EnableDebugLogging').checked;
 
-            document.querySelector('#ChromecastConfigForm')
-                .addEventListener('submit', function (e) {
-                    e.preventDefault();
-                    saveConfig(this.closest('.page'));
-                    return false;
-                });
-        })();
-    </script>
+                        ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
+                            Dashboard.processPluginConfigurationUpdateResult(result);
+                        });
+                    });
+                }
+
+                document.querySelector('#ChromecastConfigPage')
+                    .addEventListener('pageshow', function () {
+                        loadConfig(this);
+                    });
+
+                document.querySelector('#ChromecastConfigForm')
+                    .addEventListener('submit', function (e) {
+                        e.preventDefault();
+                        saveConfig(this.closest('.page'));
+                        return false;
+                    });
+            })();
+        </script>
+    </div>
 </body>
 </html>

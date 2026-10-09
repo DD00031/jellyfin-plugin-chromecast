@@ -106,7 +106,18 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     /// <summary>Bumped by every cast and Stop, so a delayed receiver close can tell it's been superseded.</summary>
     private int _castGeneration;
 
-    private static readonly TimeSpan IdleCloseAfter = TimeSpan.FromMinutes(3);
+    /// <summary>
+    /// Fallback for when a disconnect goes unnoticed (app killed, or a client that doesn't send
+    /// SessionsStop) - the receiver disables CAF's own idle timeout.
+    /// </summary>
+    private static readonly object LastTargetLock = new();
+
+    private static readonly TimeSpan IdleCloseAfter = TimeSpan.FromMinutes(30);
+
+    private Guid _lastControllingUserId;
+
+    /// <summary>The user this receiver was opened for on a connect guess, until a real command confirms it.</summary>
+    private Guid _openedOnConnectFor;
 
     private long _lastActivityTicks = DateTime.UtcNow.Ticks;
 
@@ -177,6 +188,30 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         }
 
         MarkActivity();
+
+        var controllingUserId = data switch
+        {
+            PlayRequest play => play.ControllingUserId,
+            GeneralCommand general => general.ControllingUserId,
+            PlaystateRequest playstate when Guid.TryParse(playstate.ControllingUserId, out var id) => id,
+            _ => Guid.Empty
+        };
+        if (controllingUserId != Guid.Empty)
+        {
+            _lastControllingUserId = controllingUserId;
+            _openedOnConnectFor = Guid.Empty;
+            RememberAsLastTarget(controllingUserId);
+
+            // This is the Chromecast the user actually picked - close any other one that was
+            // opened on the connect guess (see OnRemoteControlStartedAsync).
+            foreach (var other in _sessionManager.Sessions.SelectMany(s => s.SessionControllers).OfType<ChromecastSessionController>())
+            {
+                if (!ReferenceEquals(other, this))
+                {
+                    _ = other.CloseIfOpenedOnConnectForAsync(controllingUserId);
+                }
+            }
+        }
 
         try
         {
@@ -475,11 +510,10 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             switch (command.Command)
             {
                 case PlaystateCommand.Stop:
+                    // The receiver returns to its "ready" screen on its own. It stays open (and the
+                    // token stays valid - its backdrop rotation still uses it) until the client
+                    // disconnects; see OnRemoteControlEndedAsync.
                     await SendReceiverCommandAsync("Stop", null).ConfigureAwait(false);
-
-                    // Jellyfin holds the client's Stop request open until this returns, so don't
-                    // make it wait out the close delay.
-                    _ = CloseReceiverAppAsync();
                     break;
                 case PlaystateCommand.Pause:
                     await SendReceiverCommandAsync("Pause", null).ConfigureAwait(false);
@@ -512,7 +546,129 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
     }
 
     /// <summary>
-    /// Closes the Jellyfin receiver after an explicit Stop so the TV returns to its normal screen.
+    /// Gets the device id of this Chromecast's Jellyfin session.
+    /// </summary>
+    public string DeviceId => _session.DeviceId;
+
+    /// <summary>
+    /// Called when a Jellyfin client of <paramref name="userId"/> connects to a remote player and
+    /// this Chromecast is the best guess for which one (see <see cref="RemoteControlListener"/>).
+    /// Opens the receiver's "ready" screen so the TV reacts to the connect itself.
+    /// </summary>
+    /// <param name="userId">The user whose client connected.</param>
+    /// <returns>A task that completes once the receiver is open, or the attempt failed.</returns>
+    public async Task OnRemoteControlStartedAsync(Guid userId)
+    {
+        if (_disposed || _appTransportId is not null)
+        {
+            return;
+        }
+
+        Interlocked.Increment(ref _castGeneration);
+        MarkActivity();
+
+        try
+        {
+            var client = await EnsureConnectedAsync(CancellationToken.None).ConfigureAwait(false);
+            if (client is null || _connectSdkChannel is null)
+            {
+                return;
+            }
+
+            var (accessToken, user) = await GetAccessTokenAsync(_userManager.GetUserById(userId), CancellationToken.None).ConfigureAwait(false);
+            if (accessToken is null || user is null)
+            {
+                return;
+            }
+
+            var (transportId, launched) = await EnsureReceiverAppAsync(client, CancellationToken.None).ConfigureAwait(false);
+            if (transportId is null)
+            {
+                return;
+            }
+
+            if (launched)
+            {
+                _openedOnConnectFor = userId;
+                _logger.LogInformation("Opened the ready screen on {Name} because {User} connected to a remote player", _receiver.Name, user.Username);
+            }
+
+            await _connectSdkChannel.SendCommandAsync("Identify", user.Id, accessToken, _serverAddress, _receiver.Name, null, transportId).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error opening the ready screen on Chromecast {Name}", _receiver.Name);
+            InvalidateConnection();
+        }
+    }
+
+    private Task CloseIfOpenedOnConnectForAsync(Guid userId)
+    {
+        if (_openedOnConnectFor != userId || userId == Guid.Empty)
+        {
+            return Task.CompletedTask;
+        }
+
+        _openedOnConnectFor = Guid.Empty;
+        _logger.LogInformation("{Name} was opened on a connect guess but another Chromecast was chosen, closing it", _receiver.Name);
+        return CloseReceiverAppAsync();
+    }
+
+    private void RememberAsLastTarget(Guid userId)
+    {
+        var plugin = Plugin.Instance;
+        if (plugin is null)
+        {
+            return;
+        }
+
+        lock (LastTargetLock)
+        {
+            var targets = plugin.Configuration.LastCastTargets ?? [];
+            if (targets.Any(t => t.UserId == userId && t.DeviceId == DeviceId))
+            {
+                return;
+            }
+
+            plugin.Configuration.LastCastTargets = targets
+                .Where(t => t.UserId != userId)
+                .Append(new LastCastTarget { UserId = userId, DeviceId = DeviceId })
+                .ToArray();
+            plugin.SaveConfiguration();
+        }
+    }
+
+    /// <summary>
+    /// Called when a Jellyfin client of <paramref name="userId"/> disconnects from its remote
+    /// player (see <see cref="RemoteControlListener"/>). Closes the receiver if that user was the
+    /// one controlling this Chromecast.
+    /// </summary>
+    /// <param name="userId">The user whose client disconnected.</param>
+    /// <returns>A task that completes once the receiver is closed or left alone.</returns>
+    public async Task OnRemoteControlEndedAsync(Guid userId)
+    {
+        if (_disposed || _appTransportId is null || (userId != _lastControllingUserId && userId != _openedOnConnectFor))
+        {
+            return;
+        }
+
+        _openedOnConnectFor = Guid.Empty;
+
+        _logger.LogInformation("Controlling client disconnected from {Name}, closing the Jellyfin receiver", _receiver.Name);
+        try
+        {
+            await SendReceiverCommandAsync("Stop", null).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Error stopping playback on {Name} before closing", _receiver.Name);
+        }
+
+        await CloseReceiverAppAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Closes the Jellyfin receiver so the TV returns to its normal screen.
     /// The receiver disables CAF's idle timeout and only exits once every sender disconnects, and
     /// this plugin's own heartbeat/keep-alive would otherwise keep it on screen indefinitely.
     /// </summary>
@@ -725,15 +881,30 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
         // password - the receiver needs its own token because it makes its own API calls
         // (PlaybackInfo negotiation, playback reporting) as a genuine authenticated Jellyfin
         // client, just like the receiver does when launched by a Chrome sender.
-        var authResult = await _sessionManager.AuthenticateDirect(new AuthenticationRequest
+        MediaBrowser.Controller.Authentication.AuthenticationResult authResult;
+        try
         {
-            UserId = user.Id,
-            Username = user.Username,
-            App = "Jellyfin Chromecast Plugin",
-            AppVersion = _appHost.ApplicationVersionString,
-            DeviceId = "chromecast-" + _session.DeviceId,
-            DeviceName = _receiver.Name
-        }).ConfigureAwait(false);
+            authResult = await _sessionManager.AuthenticateDirect(new AuthenticationRequest
+            {
+                UserId = user.Id,
+                Username = user.Username,
+                App = "Jellyfin Chromecast Plugin",
+                AppVersion = _appHost.ApplicationVersionString,
+                DeviceId = "chromecast-" + _session.DeviceId,
+                DeviceName = _receiver.Name
+            }).ConfigureAwait(false);
+        }
+        catch (System.Security.SecurityException ex)
+        {
+            // Most likely "User is at their maximum number of sessions": every cast signs the
+            // Chromecast in as the casting user, which counts against that user's session limit.
+            _logger.LogError(
+                "Cannot cast to {Name} as {User}: {Reason} If this user has a simultaneous session limit (Dashboard > Users), raise it or set it to 0 - each cast needs up to 2 extra sessions.",
+                _receiver.Name,
+                user.Username,
+                ex.Message);
+            return (null, null);
+        }
 
         _mintedAccessToken = authResult.AccessToken;
         _mintedTokenUserId = user.Id;
@@ -780,9 +951,9 @@ public sealed class ChromecastSessionController : ISessionController, IAsyncDisp
             // silencing all of SharpCaster's own diagnostics - including exactly the heartbeat
             // ping/pong/timeout logging needed to debug the connection-longevity issue in
             // CLAUDE.md. Pass a real logger.
-            var client = new ChromecastClient(_loggerFactory.CreateLogger<ChromecastClient>());
+            var client = new ChromecastClient(new VerboseGatedLogger<ChromecastClient>(_loggerFactory.CreateLogger<ChromecastClient>(), routineInfoIsVerbose: true));
 
-            var connectSdkChannel = new ConnectSdkChannel(_loggerFactory.CreateLogger<ConnectSdkChannel>());
+            var connectSdkChannel = new ConnectSdkChannel(new VerboseGatedLogger<ConnectSdkChannel>(_loggerFactory.CreateLogger<ConnectSdkChannel>(), routineInfoIsVerbose: false));
             client.AddChannel(connectSdkChannel);
             connectSdkChannel.StatusReceived += OnConnectSdkStatusReceived;
 
