@@ -1,7 +1,7 @@
 ---
 name: "Chromecast"
 guid: "06afff54-6a74-4e08-9d50-9fa63803c73d"
-version: "0.1.5.0"
+version: "0.1.6.0"
 targetAbi: "12.0.0.0"
 framework: "net10.0"
 owner: "DD00031"
@@ -17,6 +17,8 @@ category: "General"
 artifacts:
 - "Jellyfin.Plugin.Chromecast.dll"
 changelog: >
+  0.1.6.0: A Chromecast that is switched off or unplugged is now noticed within seconds: the settings page shows its real status and it leaves the cast menu, also when it has a custom name. The ready screen appears again on the first connect after a Chromecast restarted. The TV goes back to the ready screen 30 seconds after showing a movie's details instead of staying on them. A video you move from the app's player to the Chromecast keeps playing when you close the player. Every command to a Chromecast now has a time limit, so a device that stops answering can no longer leave the app waiting. New setting: skip the Chromecast's network speed test for a faster start on fast, steady networks (off by default). Works on Jellyfin 12.0, 12.1 and 12.2.
+
   0.1.5.0: Chromecasts no longer disappear from the cast menu for minutes at a time: a device is only removed when it really can't be reached. Switching quickly between videos now always ends on the last one you picked. 'Play from here' in a list starts at the item you chose instead of the first. Each cast now uses one Jellyfin session for the casting user instead of two, so per-user session limits are reached half as fast. Works on Jellyfin 12.0, 12.1 and 12.2.
 
   0.1.4.0: The TV now follows what you do in the app: connecting shows Jellyfin's ready screen (on the Chromecast you used last), opening a movie shows it on the TV, Stop goes back to the ready screen, and Disconnect closes Jellyfin on the TV. If a cast can't start, the app tells you why. The settings page works now (it never loaded or saved before) and lists your Chromecasts with their status, a Test button, and options to rename or hide each one. Routine discovery lines are gone from the server log unless Verbose logging is on. Works on Jellyfin 12.0, 12.1 and 12.2. Note: each cast uses up to 2 extra sessions for the casting user, so a per-user session limit must leave room for that.
